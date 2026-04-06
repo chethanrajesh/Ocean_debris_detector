@@ -1,0 +1,66 @@
+# ── Credentials & Secrets ────────────────────────────────────────────────────
+backend/.env
+frontend/.env.local
+frontend/.env
+**/*.json
+# Re-allow non-secret JSON configs
+!frontend/tsconfig.json
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/eslint.config.mjs
+!frontend/postcss.config.mjs
+
+# ── GEE Service Account Key ────────────────────────────────────────────────
+backend/*.json
+backend/practical-bebop-*.json
+
+# ── Large Data Files ─────────────────────────────────────────────────────────
+backend/data/
+backend/data/raw/
+backend/data/processed/
+backend/data/predictions/
+**/*.npy
+**/*.nc
+**/*.npz
+**/*.h5
+**/*.hdf5
+**/*.tif
+**/*.tiff
+**/*.pkl
+**/*.pt
+**/*.pth
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.Python
+
+# ── Node / Next.js ───────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+*.log
+npm-debug.log*
+
+# ── OS & Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Keep docker-compose.yml but ignore local overrides
+docker-compose.override.yml

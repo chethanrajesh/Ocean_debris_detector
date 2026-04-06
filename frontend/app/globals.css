@@ -1,0 +1,188 @@
+/* ─── Global Design System ──────────────────────────────────────────────────
+   Ocean Debris Monitoring Dashboard — Premium Dark Theme
+   Fonts: Inter (body), Syne (headings)
+   Color palette: Deep ocean dark + electric teal + amber alerts
+────────────────────────────────────────────────────────────────────────────── */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Syne:wght@600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── CSS Custom Properties ── */
+:root {
+  --ocean-950:  #020a12;
+  --ocean-900:  #050f1c;
+  --ocean-800:  #081829;
+  --ocean-700:  #0d2540;
+  --ocean-600:  #133558;
+  --ocean-500:  #1a4d7e;
+  --ocean-400:  #2167a8;
+  --teal-500:   #00d4c8;
+  --teal-400:   #20e5db;
+  --teal-glow:  rgba(0, 212, 200, 0.18);
+  --amber-500:  #f59e0b;
+  --red-500:    #ef4444;
+  --orange-500: #f97316;
+  --green-500:  #22c55e;
+  --text-primary:   #e8f4f8;
+  --text-secondary: #94b3c4;
+  --text-muted:     #4d7a91;
+  --glass-bg:   rgba(5, 15, 28, 0.82);
+  --glass-border: rgba(0, 212, 200, 0.15);
+  --panel-bg:   rgba(8, 24, 41, 0.90);
+}
+
+/* ── Base Reset ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background-color: var(--ocean-950);
+  color: var(--text-primary);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* ── Scrollbar Styling ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--ocean-900); }
+::-webkit-scrollbar-thumb { background: var(--ocean-500); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--teal-500); }
+
+/* ── Typography ── */
+.font-display { font-family: 'Syne', sans-serif; }
+.font-mono    { font-family: 'JetBrains Mono', monospace; }
+
+/* ── Glass Morphism Panel ── */
+.glass-panel {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: 16px;
+}
+
+.glass-panel-dark {
+  background: var(--panel-bg);
+  border: 1px solid rgba(0, 212, 200, 0.10);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-radius: 12px;
+}
+
+/* ── Teal Glow Effects ── */
+.teal-glow-sm  { box-shadow: 0 0 12px var(--teal-glow); }
+.teal-glow-md  { box-shadow: 0 0 24px var(--teal-glow), 0 0 48px rgba(0,212,200,0.08); }
+.teal-glow-lg  { box-shadow: 0 0 40px var(--teal-glow), 0 0 80px rgba(0,212,200,0.12); }
+
+.text-teal   { color: var(--teal-500); }
+.text-teal-b { color: var(--teal-400); }
+
+/* ── Severity Badge Tokens ── */
+.badge-critical { background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.4); color: #fca5a5; }
+.badge-high     { background: rgba(249,115,22,0.15); border: 1px solid rgba(249,115,22,0.4); color: #fdba74; }
+.badge-moderate { background: rgba(234,179,8,0.15); border: 1px solid rgba(234,179,8,0.4); color: #fde047; }
+
+/* ── Animated Background Grid ── */
+.ocean-grid-bg {
+  background-image:
+    linear-gradient(rgba(0,212,200,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,212,200,0.03) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+/* ── Animated Pulse Ring (for critical hotspots) ── */
+@keyframes pulse-ring {
+  0%   { transform: scale(0.8); opacity: 0.8; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+.pulse-ring {
+  animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* ── Fade-in animation ── */
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in-up { animation: fade-in-up 0.4s ease-out both; }
+
+/* ── Slide-in from right ── */
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(24px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.animate-slide-in { animation: slide-in-right 0.35s ease-out both; }
+
+/* ── Loading skeleton shimmer ── */
+@keyframes shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--ocean-800) 25%, var(--ocean-700) 50%, var(--ocean-800) 75%);
+  background-size: 400px 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 8px;
+}
+
+/* ── Progress Bar ── */
+.progress-bar-track {
+  background: var(--ocean-700);
+  border-radius: 999px;
+  overflow: hidden;
+  height: 6px;
+}
+.progress-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--teal-500), var(--teal-400));
+  transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.progress-bar-fill.critical { background: linear-gradient(90deg, #ef4444, #f87171); }
+.progress-bar-fill.high     { background: linear-gradient(90deg, #f97316, #fb923c); }
+.progress-bar-fill.moderate { background: linear-gradient(90deg, #eab308, #facc15); }
+
+/* ── Slider ── */
+input[type=range] {
+  -webkit-appearance: none;
+  height: 4px;
+  background: var(--ocean-600);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px; height: 18px;
+  background: var(--teal-500);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--teal-glow);
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+input[type=range]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+  box-shadow: 0 0 16px var(--teal-glow);
+}
+
+/* ── Map container ── */
+#gee-map-container {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+/* ── Custom scroll region in panels ── */
+.panel-scroll {
+  overflow-y: auto;
+  max-height: calc(100vh - 200px);
+  scrollbar-width: thin;
+  scrollbar-color: var(--ocean-500) transparent;
+}
+
+/* ── Divider ── */
+.divider { border: none; border-top: 1px solid var(--glass-border); margin: 12px 0; }
