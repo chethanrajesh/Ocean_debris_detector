@@ -15,55 +15,69 @@
  */
 
 import { useEffect, useRef } from "react";
-import { PredictionNode } from "@/lib/api";
+import { PredictionNode, PredictionMode } from "@/lib/api";
 
 interface HeatmapLayerProps {
-  map: google.maps.Map | null;
+  map:  google.maps.Map | null;
   nodes: PredictionNode[];
+  /** "real" (t=0, satellite-seeded) or "predicted" (GNN forecast, t>0) */
+  mode?: PredictionMode;
 }
 
-// ── Colour look-up table (256 stops, pre-computed once) ──────────────────────
-function buildColorLUT(): Uint8ClampedArray {
-  // Gradient stops: [position 0–1, r, g, b]
-  const stops: [number, number, number, number][] = [
-    [0.00,   0,   0,  80],   // deep navy  (transparent in canvas)
-    [0.15,   0,  50, 140],   // dark blue
-    [0.30,   0, 140, 200],   // ocean blue
-    [0.45,   0, 212, 200],   // teal
-    [0.60, 100, 230, 120],   // green
-    [0.72, 240, 220,   0],   // yellow
-    [0.85, 255, 140,   0],   // orange
-    [1.00, 230,  30,  30],   // red
-  ];
+// ── Colour look-up table builder ─────────────────────────────────────────────
+type ColorStop = [number, number, number, number];
 
+function buildColorLUT(stops: ColorStop[], globalAlpha = 1.0): Uint8ClampedArray {
   const lut = new Uint8ClampedArray(256 * 4);
   for (let i = 0; i < 256; i++) {
     const t = i / 255;
-    // Find surrounding stops
     let lo = stops[0], hi = stops[stops.length - 1];
     for (let s = 0; s < stops.length - 1; s++) {
-      if (t >= stops[s][0] && t <= stops[s + 1][0]) {
-        lo = stops[s];
-        hi = stops[s + 1];
-        break;
-      }
+      if (t >= stops[s][0] && t <= stops[s + 1][0]) { lo = stops[s]; hi = stops[s + 1]; break; }
     }
     const span = hi[0] - lo[0] || 1;
-    const f = (t - lo[0]) / span;
+    const f    = (t - lo[0]) / span;
     lut[i * 4 + 0] = Math.round(lo[1] + (hi[1] - lo[1]) * f);
     lut[i * 4 + 1] = Math.round(lo[2] + (hi[2] - lo[2]) * f);
     lut[i * 4 + 2] = Math.round(lo[3] + (hi[3] - lo[3]) * f);
-    lut[i * 4 + 3] = i < 10 ? 0 : Math.min(255, Math.round(i * 0.85)); // alpha
+    const rawAlpha  = i < 10 ? 0 : Math.min(255, Math.round(i * 0.85));
+    lut[i * 4 + 3] = Math.round(rawAlpha * globalAlpha);
   }
   return lut;
 }
 
-const COLOR_LUT = buildColorLUT();
+// Real data: warm, fully saturated — «this is confirmed»
+const REAL_STOPS: ColorStop[] = [
+  [0.00,   0,   0,  80],
+  [0.15,   0,  50, 150],
+  [0.30,   0, 150, 210],
+  [0.45,   0, 220, 200],
+  [0.60, 120, 235, 100],
+  [0.72, 250, 220,   0],
+  [0.85, 255, 130,   0],
+  [1.00, 230,  20,  20],
+];
+const REAL_LUT = buildColorLUT(REAL_STOPS, 1.0);
+
+// Predicted data: cooler (blues/purples dominate), 80% opacity — «this is a forecast»
+const PRED_STOPS: ColorStop[] = [
+  [0.00,   0,   0, 100],
+  [0.15,   0,  40, 160],
+  [0.30,  30, 100, 210],
+  [0.45,  60, 180, 220],
+  [0.60, 100, 200, 190],
+  [0.72, 180, 180,  50],
+  [0.85, 220, 100,  30],
+  [1.00, 190,  30, 180],   // magenta-red for peak predictions
+];
+const PRED_LUT = buildColorLUT(PRED_STOPS, 0.78);
+
 
 // ── CanvasHeatmapOverlay ─────────────────────────────────────────────────────
 function createCanvasOverlay(
   map: google.maps.Map,
   getNodes: () => PredictionNode[],
+  getLut:   () => Uint8ClampedArray,
 ): google.maps.OverlayView {
   class CanvasHeatmapOverlay extends window.google.maps.OverlayView {
     private canvas: HTMLCanvasElement | null = null;
@@ -119,8 +133,8 @@ function createCanvasOverlay(
       const nodes = getNodes();
       if (!nodes.length) return;
 
-      // Scale the gaussian blob radius by DPR so it looks the same visually
-      const R = Math.round(this.RADIUS * dpr);
+      const lut = getLut();
+      const R   = Math.round(this.RADIUS * dpr);
 
       // ── 1. Float32 accumulator ─────────────────────────────────────────────
       const acc = new Float32Array(PW * PH);
@@ -167,10 +181,10 @@ function createCanvasOverlay(
         if (acc[i] < 0.001) { pixels[i * 4 + 3] = 0; continue; }
         const t      = Math.pow(acc[i] / peak, 0.6);
         const lutIdx = Math.min(255, Math.round(t * 255)) * 4;
-        pixels[i * 4]     = COLOR_LUT[lutIdx];
-        pixels[i * 4 + 1] = COLOR_LUT[lutIdx + 1];
-        pixels[i * 4 + 2] = COLOR_LUT[lutIdx + 2];
-        pixels[i * 4 + 3] = COLOR_LUT[lutIdx + 3];
+        pixels[i * 4]     = lut[lutIdx];
+        pixels[i * 4 + 1] = lut[lutIdx + 1];
+        pixels[i * 4 + 2] = lut[lutIdx + 2];
+        pixels[i * 4 + 3] = lut[lutIdx + 3];
       }
 
       ctx.putImageData(imgData, 0, 0);
@@ -189,30 +203,34 @@ function createCanvasOverlay(
   return overlay;
 }
 
-// ── React component ──────────────────────────────────────────────────────────
-export default function HeatmapLayer({ map, nodes }: HeatmapLayerProps) {
-  const overlayRef  = useRef<google.maps.OverlayView | null>(null);
-  // Keep a mutable ref to latest nodes so the overlay's draw() always reads current data
-  const nodesRef    = useRef<PredictionNode[]>(nodes);
+// ── React component ───────────────────────────────────────────────────────────
+export default function HeatmapLayer({ map, nodes, mode = "real" }: HeatmapLayerProps) {
+  const overlayRef   = useRef<google.maps.OverlayView | null>(null);
+  const nodesRef     = useRef<PredictionNode[]>(nodes);
   const listenersRef = useRef<google.maps.MapsEventListener[]>([]);
+  const modeRef      = useRef<PredictionMode>(mode);
 
-  // Update the mutable ref whenever nodes change
-  useEffect(() => {
-    nodesRef.current = nodes;
-    // Force a redraw if the overlay already exists
+  // Keep refs current
+  useEffect(() => { nodesRef.current = nodes; triggerDraw(); }, [nodes]);
+  useEffect(() => { modeRef.current  = mode;  triggerDraw(); }, [mode]);
+
+  function triggerDraw() {
     if (overlayRef.current) {
       (overlayRef.current as google.maps.OverlayView & { draw: () => void }).draw?.();
     }
-  }, [nodes]);
+  }
 
   // Create overlay once when map is ready
   useEffect(() => {
     if (!map || !window.google?.maps) return;
 
-    const overlay = createCanvasOverlay(map, () => nodesRef.current);
+    const overlay = createCanvasOverlay(
+      map,
+      () => nodesRef.current,
+      () => modeRef.current === "real" ? REAL_LUT : PRED_LUT,
+    );
     overlayRef.current = overlay;
 
-    // Redraw on map events
     const events = ["idle", "zoom_changed", "bounds_changed", "resize"];
     listenersRef.current = events.map((evt) =>
       window.google.maps.event.addListener(map, evt, () => {

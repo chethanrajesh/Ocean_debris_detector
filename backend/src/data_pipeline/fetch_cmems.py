@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 RESOLUTION = 0.25
 
-# Analysis / forecast dataset
-ANFC_DATASET = "cmems_mod_glo_phy_anfc_0.083deg_P1D-m"
-# Historical reanalysis dataset
+# Analysis / forecast current dataset (ocean velocity u/v)
+ANFC_DATASET = "cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m"
+# Historical reanalysis current dataset
 HIST_DATASET = "cmems_mod_glo_phy_my_0.083_P1D-m"
 
 
@@ -122,10 +122,13 @@ def fetch_cmems_analysis() -> np.ndarray:
         u_025, v_025 = _interp_to_025(lats, lons, u, v)
         result = np.stack([u_025, v_025], axis=-1)
 
-        out_path = DATA_DIR / "cmems_currents.npy"
+        # Save both as cmems_currents.npy and ocean_currents.npy
+        # (ocean_currents.npy is what the rest of the pipeline reads)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        np.save(str(out_path), result)
-        logger.info(f"Saved cmems_currents.npy — shape {result.shape}")
+        np.save(str(DATA_DIR / "cmems_currents.npy"),  result)
+        np.save(str(DATA_DIR / "ocean_currents.npy"),  result)
+        logger.info(f"Saved cmems_currents.npy + ocean_currents.npy — shape {result.shape}, "
+                    f"max |u|={float(np.abs(result[...,0]).max()):.3f} m/s")
         return result
 
     except Exception as exc:

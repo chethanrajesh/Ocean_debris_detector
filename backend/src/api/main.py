@@ -21,6 +21,7 @@ import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 load_dotenv()
 logging.basicConfig(
@@ -28,6 +29,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(module)s — %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+DATA_DIR   = Path(__file__).parent.parent.parent / "data"
+RESOLUTION = 0.25
+
+
+class SeedRequest(BaseModel):
+    lat:     float
+    lon:     float
+    mass_kg: float = 1.0
+
 
 DATA_DIR   = Path(__file__).parent.parent.parent / "data"
 RESOLUTION = 0.25
@@ -41,8 +52,35 @@ class AppState:
     predictions: np.ndarray | None = None    # (N_ocean, T)
     nodes: np.ndarray | None = None          # (N_ocean, 7)
     currents: np.ndarray | None = None       # (N_lat, N_lon, 2)
-    land_mask: np.ndarray | None = None      # (N_lat, N_lon) bool
+    land_mask: np.ndarray | None = None      # (N_lat, N_lon) bool  — True = ocean
+    ocean_node_mask: np.ndarray | None = None  # (N_ocean,) bool — pre-computed per-node ocean flag
     ready: bool = False
+    # ── Trajectory mode ───────────────────────────────────────────────────────
+    trajectories: np.ndarray | None  = None   # (N_particles, 14, 5)
+    beaching_risk: np.ndarray | None = None   # (720, 1440)
+    trajectory_ready: bool = False
+
+
+# ── Land-mask utility ─────────────────────────────────────────────────────────
+
+def _build_ocean_node_mask(
+    nodes: np.ndarray,
+    land_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Vectorised: given node coords (N, 7) and land_mask (n_lat, n_lon),
+    return a boolean array (N,) — True where the node sits on an ocean cell.
+    """
+    n_lat, n_lon = land_mask.shape
+    il = np.clip(
+        np.round((nodes[:, 0] + 90  - RESOLUTION / 2) / RESOLUTION).astype(int),
+        0, n_lat - 1,
+    )
+    jl = np.clip(
+        np.round((nodes[:, 1] + 180 - RESOLUTION / 2) / RESOLUTION).astype(int),
+        0, n_lon - 1,
+    )
+    return land_mask[il, jl].astype(bool)   # (N,)
 
 
 state = AppState()
@@ -67,16 +105,35 @@ def _load_all_data():
     state.land_mask   = _try("land_mask.npy", (n_lat, n_lon))
     state.currents    = _try("ocean_currents.npy", (n_lat, n_lon, 2))
 
+    # Pre-compute per-node ocean boolean mask (used by /predictions to strip land)
+    if state.nodes is not None and state.land_mask is not None:
+        state.ocean_node_mask = _build_ocean_node_mask(state.nodes, state.land_mask.astype(bool))
+        n_ocean = int(state.ocean_node_mask.sum())
+        n_total = len(state.nodes)
+        logger.info(f"Ocean node mask ready: {n_ocean}/{n_total} nodes are ocean cells")
+    else:
+        state.ocean_node_mask = None
+
     if state.predictions is not None and state.nodes is not None:
-        # Pre-detect hotspots
-        try:
-            from src.simulation.hotspot_detector import detect
-            state.hotspots = detect()
-            logger.info(f"Hotspot detection complete — {len(state.hotspots)} hotspots")
-        except Exception as exc:
-            logger.error(f"Hotspot detection failed: {exc}")
-            state.hotspots = []
-        state.ready = True
+        # Check if simulation actually produced meaningful (non-zero) output
+        max_pred = float(np.max(state.predictions)) if state.predictions is not None else 0.0
+        if max_pred < 0.01:
+            logger.warning(
+                f"future_predictions.npy max value is {max_pred:.6f} — simulation output "
+                "appears to be all-zero. Falling back to demo data. "
+                "Re-run src.simulation.hybrid_runner to generate real predictions."
+            )
+            _seed_demo_data()
+        else:
+            # Pre-detect hotspots from real simulation output
+            try:
+                from src.simulation.hotspot_detector import detect
+                state.hotspots = detect()
+                logger.info(f"Hotspot detection complete — {len(state.hotspots)} hotspots")
+            except Exception as exc:
+                logger.error(f"Hotspot detection failed: {exc}")
+                state.hotspots = []
+            state.ready = True
     else:
         logger.warning(
             "Core data (nodes.npy / future_predictions.npy) not found. "
@@ -86,6 +143,19 @@ def _load_all_data():
         state.ready = False
         # Seed demo data so the frontend can render something immediately
         _seed_demo_data()
+
+    # ── Load trajectory simulation outputs (independent of hotspot mode) ───────
+    traj_path  = DATA_DIR / "trajectories.npy"
+    beach_path = DATA_DIR / "beaching_risk.npy"
+    if traj_path.exists():
+        state.trajectories = np.load(str(traj_path))
+        logger.info(f"Loaded trajectories.npy — shape {state.trajectories.shape}")
+    else:
+        logger.warning("trajectories.npy not found. Run: python -m src.simulation.trajectory_simulator")
+    if beach_path.exists():
+        state.beaching_risk = np.load(str(beach_path))
+        logger.info(f"Loaded beaching_risk.npy — shape {state.beaching_risk.shape}")
+    state.trajectory_ready = state.trajectories is not None
 
 
 def _seed_demo_data():
@@ -227,70 +297,514 @@ def get_hotspots() -> list[dict[str, Any]]:
     return state.hotspots
 
 
+# Max steps exposed to the frontend = 90 days × 4 steps/day = 360
+_MAX_TIMESTEPS = 360
+
+
 @app.get("/predictions/{timestep}", tags=["Debris"])
 def get_predictions(timestep: int) -> dict[str, Any]:
     """
     Return per-node plastic density for a specific time step.
 
-    timestep : integer in [0, T-1]  (T ≈ 365 for 90-day simulation at 6h resolution)
+    timestep = 0  → real initial debris positions (seeded from satellite/buoy data)
+    timestep > 0  → GNN + Lagrangian prediction (4 steps per day, max 90 days = 360)
+
+    Nodes that fall on land cells are excluded (land_mask filtered).
+    Returns up to 3000 highest-density ocean nodes for bandwidth efficiency.
     """
     if state.predictions is None or state.nodes is None:
         raise HTTPException(status_code=503, detail="Prediction data not available.")
 
-    T = state.predictions.shape[1]
-    if not (0 <= timestep < T):
+    T_full = state.predictions.shape[1]
+    T      = min(T_full, _MAX_TIMESTEPS + 1)   # cap to 90 days
+    if not (0 <= timestep <= _MAX_TIMESTEPS):
         raise HTTPException(
             status_code=400,
-            detail=f"timestep must be in [0, {T - 1}]. Got {timestep}."
+            detail=f"timestep must be in [0, {_MAX_TIMESTEPS}] (0–90 days). Got {timestep}.",
         )
 
-    densities = state.predictions[:, timestep]   # (N,)
-    lats      = state.nodes[:, 0]
-    lons      = state.nodes[:, 1]
+    densities = state.predictions[:, min(timestep, T_full - 1)]  # (N,)
+    lats      = state.nodes[:, 0]   # (N,)
+    lons      = state.nodes[:, 1]   # (N,)
+
+    # ── Apply land-mask filter ───────────────────────────────────────────────
+    if state.ocean_node_mask is not None:
+        ocean_bool = state.ocean_node_mask
+        densities  = densities[ocean_bool]
+        lats       = lats[ocean_bool]
+        lons       = lons[ocean_bool]
+
+    # ── Skip near-zero density nodes ─────────────────────────────────────────
+    sig_mask  = densities > 0.05
+    d_f, la_f, lo_f = densities[sig_mask], lats[sig_mask], lons[sig_mask]
+
+    # ── Cap to 3000 highest-density nodes ────────────────────────────────────
+    MAX_NODES = 3000
+    if len(d_f) > MAX_NODES:
+        top_idx        = np.argpartition(d_f, -MAX_NODES)[-MAX_NODES:]
+        d_f, la_f, lo_f = d_f[top_idx], la_f[top_idx], lo_f[top_idx]
 
     nodes_out = [
-        {"lat": round(float(lats[i]), 4), "lon": round(float(lons[i]), 4),
-         "density": round(float(densities[i]), 4)}
-        for i in range(len(lats))
-        if densities[i] > 0.05   # skip negligible-density nodes for bandwidth
+        {
+            "lat":     round(float(la_f[i]), 4),
+            "lon":     round(float(lo_f[i]), 4),
+            "density": round(float(d_f[i]),  4),
+        }
+        for i in range(len(d_f))
     ]
 
+    # t=0 = real seeded data; t>0 = GNN+Lagrangian forecast
+    mode = "real" if timestep == 0 else "predicted"
+
     return {
-        "timestep": timestep,
-        "total_timesteps": int(T),
-        "nodes": nodes_out,
+        "timestep":        timestep,
+        "total_timesteps": _MAX_TIMESTEPS + 1,   # 361 steps (0–360)
+        "mode":            mode,
+        "day":             round(timestep / 4, 1),
+        "nodes":           nodes_out,
     }
 
 
+
 @app.get("/currents", tags=["Oceanography"])
-def get_currents() -> dict[str, Any]:
+def get_currents(max_nodes: int = 2000) -> dict[str, Any]:
     """
-    Return ocean current vectors (u, v in m/s) sampled at each graph node.
+    Return ocean current vectors (u, v in m/s) on a coarse grid.
+    Falls back to synthetic gyre circulation when real current data is all-zero.
     """
-    if state.nodes is None or state.currents is None:
-        raise HTTPException(status_code=503, detail="Current data not available.")
+    if state.nodes is None:
+        raise HTTPException(status_code=503, detail="Node data not available.")
 
     n_lat = int(180 / RESOLUTION)
     n_lon = int(360 / RESOLUTION)
-    lats_grid = np.linspace(-90 + RESOLUTION / 2, 90 - RESOLUTION / 2, n_lat)
-    lons_grid = np.linspace(-180 + RESOLUTION / 2, 180 - RESOLUTION / 2, n_lon)
 
-    nodes_out = []
-    for i in range(len(state.nodes)):
-        lat = float(state.nodes[i, 0])
-        lon = float(state.nodes[i, 1])
-        # Index into current grid
-        il = int(np.clip(round((lat + 90 - RESOLUTION / 2) / RESOLUTION), 0, n_lat - 1))
-        jl = int(np.clip(round((lon + 180 - RESOLUTION / 2) / RESOLUTION), 0, n_lon - 1))
-        u  = float(state.currents[il, jl, 0])
-        v  = float(state.currents[il, jl, 1])
-        speed = float(np.sqrt(u**2 + v**2))
-        if speed > 0.005:   # skip near-zero currents for bandwidth
-            nodes_out.append({
-                "lat": round(lat, 4),
-                "lon": round(lon, 4),
-                "u":   round(u, 4),
-                "v":   round(v, 4),
-            })
+    lats_grid = np.linspace(-90 + RESOLUTION / 2,  90 - RESOLUTION / 2, n_lat, dtype=np.float32)
+    lons_grid = np.linspace(-180 + RESOLUTION / 2, 180 - RESOLUTION / 2, n_lon, dtype=np.float32)
 
+    # Decide which current field to use
+    curr_field = state.currents  # (720, 1440, 2) or None
+    if curr_field is None or float(np.abs(curr_field).max()) < 1e-6:
+        # Real data unavailable — generate synthetic gyre circulation
+        curr_field = _build_synthetic_currents(lats_grid, lons_grid, state.land_mask)
+
+    lats = state.nodes[:, 0]
+    lons = state.nodes[:, 1]
+
+    il = np.clip(
+        np.round((lats + 90  - RESOLUTION / 2) / RESOLUTION).astype(int), 0, n_lat - 1
+    )
+    jl = np.clip(
+        np.round((lons + 180 - RESOLUTION / 2) / RESOLUTION).astype(int), 0, n_lon - 1
+    )
+
+    u_arr = curr_field[il, jl, 0]
+    v_arr = curr_field[il, jl, 1]
+    speed = np.sqrt(u_arr ** 2 + v_arr ** 2)
+
+    mask  = speed > 0.005
+    lats_f, lons_f = lats[mask], lons[mask]
+    u_f,    v_f    = u_arr[mask], v_arr[mask]
+    spd_f          = speed[mask]
+
+    if len(spd_f) > max_nodes:
+        top_idx = np.argpartition(spd_f, -max_nodes)[-max_nodes:]
+        lats_f, lons_f, u_f, v_f = (
+            lats_f[top_idx], lons_f[top_idx], u_f[top_idx], v_f[top_idx]
+        )
+
+    nodes_out = [
+        {
+            "lat": round(float(lats_f[i]), 4),
+            "lon": round(float(lons_f[i]), 4),
+            "u":   round(float(u_f[i]), 4),
+            "v":   round(float(v_f[i]), 4),
+        }
+        for i in range(len(lats_f))
+    ]
     return {"nodes": nodes_out}
+
+
+def _build_synthetic_currents(
+    lats_grid: np.ndarray,
+    lons_grid: np.ndarray,
+    land_mask: np.ndarray | None,
+) -> np.ndarray:
+    """Build synthetic gyre circulation (mirrors trajectory_simulator logic) as a (720,1440,2) array."""
+    n_lat, n_lon = len(lats_grid), len(lons_grid)
+    u = np.zeros((n_lat, n_lon), dtype=np.float32)
+    v = np.zeros((n_lat, n_lon), dtype=np.float32)
+    lon_grid, lat_grid = np.meshgrid(lons_grid, lats_grid)
+
+    gyres = [
+        ( 32.0, -140.0, 30.0, 0.30, True),   # North Pacific
+        (-28.0, -100.0, 25.0, 0.22, False),   # South Pacific
+        ( 30.0,  -40.0, 28.0, 0.25, True),    # North Atlantic
+        (-28.0,  -15.0, 24.0, 0.20, False),   # South Atlantic
+        (-28.0,   75.0, 26.0, 0.20, False),   # Indian Ocean
+    ]
+    for clat, clon, rad, speed, cw in gyres:
+        dlat = lat_grid - clat
+        dlon = lon_grid - clon
+        dlon = np.where(dlon >  180, dlon - 360, dlon)
+        dlon = np.where(dlon < -180, dlon + 360, dlon)
+        dist = np.sqrt(dlat**2 + dlon**2)
+        envelope = np.clip((dist / rad) * np.exp(-0.5 * (dist / rad)**2) * 2.718, 0, 1) * speed
+        with np.errstate(divide="ignore", invalid="ignore"):
+            norm  = np.where(dist > 0.01, dist, 0.01)
+            rdlat = dlat / norm
+            rdlon = dlon / norm
+        sign = -1.0 if cw else 1.0
+        u += sign * rdlat * envelope
+        v += sign * (-rdlon) * envelope
+
+    # Antarctic Circumpolar Current
+    acc_mask  = lat_grid < -45
+    acc_speed = 0.25 * np.exp(((lat_grid + 60) / 15) ** 2 * -0.5)
+    u[acc_mask] += acc_speed[acc_mask]
+
+    if land_mask is not None:
+        land = ~land_mask.astype(bool)
+        u[land] = 0.0
+        v[land] = 0.0
+
+    return np.stack([u, v], axis=-1).astype(np.float32)
+
+
+# ── Known pollution source zones ──────────────────────────────────────────────
+_KNOWN_SOURCES = [
+    # East Asia
+    (30.0, 121.5, "Yangtze River Delta"),
+    (23.0, 113.5, "Pearl River Delta"),
+    (22.0, 114.0, "Hong Kong Coastal"),
+    (35.5, 139.8, "Tokyo Bay"),
+    (37.5, 126.8, "Han River / Seoul Coast"),
+    (10.0, 105.0, "Mekong Delta"),
+    (16.0, 108.0, "Vietnam Central Coast"),
+    # South/Southeast Asia
+    (23.7,  90.4, "Ganges/Brahmaputra Delta"),
+    (13.0,  80.3, "Chennai Coast"),
+    (19.1,  72.8, "Mumbai Coast"),
+    (6.9,   79.8, "Colombo Coast"),
+    (3.1,  101.5, "Klang River, Malaysia"),
+    (-6.2, 106.8, "Jakarta Coast"),
+    (-7.2, 112.7, "Surabaya Coast"),
+    # Africa
+    (5.3,   -4.0, "Abidjan Coast"),
+    (6.4,    3.4, "Lagos Bight"),
+    (-4.3,  15.3, "Congo River Mouth"),
+    (-25.9, 32.6, "Maputo Coast"),
+    # Americas
+    (18.5, -69.9, "Dominican Republic Coast"),
+    (23.1, -82.4, "Havana Coastal"),
+    (-23.0,-43.2, "Rio de Janeiro / Guanabara Bay"),
+    (10.5, -66.9, "Caracas Coastal"),
+    # Mediterranean
+    (43.3,   5.4, "Marseille Coastal"),
+    (37.9,  23.7, "Athens / Saronic Gulf"),
+    (38.2,  15.6, "Messina Strait"),
+    # Ocean accumulation gyres
+    (32.0, -141.0, "North Pacific Garbage Patch"),
+    (-32.0, -88.0, "South Pacific Gyre"),
+    (28.0,  -63.0, "Sargasso Sea / N. Atlantic Gyre"),
+    (-26.0,  76.0, "Indian Ocean Gyre"),
+]
+
+
+@app.get("/hotspots/known", tags=["Debris"])
+def get_known_zones() -> list[dict[str, Any]]:
+    """
+    Return the list of known plastic pollution source zones and ocean accumulation gyres.
+    These are fixed, research-based locations used to seed the simulation.
+    """
+    zones = []
+    for lat, lon, label in _KNOWN_SOURCES:
+        # Classify by type: river/coast vs open ocean gyre
+        is_gyre = any(k in label for k in ("Gyre", "Garbage Patch", "Sargasso"))
+        zones.append({
+            "latitude":           round(lat, 4),
+            "longitude":          round(lon, 4),
+            "label":              label,
+            "type":               "accumulation_gyre" if is_gyre else "pollution_source",
+            "plastic_density":    0.85 if is_gyre else 0.60,
+            "level":              "critical" if is_gyre else "high",
+            "accumulation_trend": "increasing",
+            "movement_vector":    {"u": 0.0, "v": 0.0},
+            "source_estimate":    label,
+        })
+    return zones
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAJECTORY ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SNAPSHOT_DAYS = [0, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 90]
+
+# Known source labels (reuse hotspot detector's list)
+_SOURCE_LABELS = [
+    (30.0,  121.5, "Yangtze River Delta / East China Sea"),
+    (23.0,  113.5, "Pearl River Delta, South China Sea"),
+    (35.5,  139.8, "Pacific Coast Japan"),
+    (10.0,  105.0, "Mekong Delta, Gulf of Thailand"),
+    (23.7,   90.4, "Bay of Bengal / Bangladesh coast"),
+    (13.0,   80.3, "Bay of Bengal / India SE coast"),
+    ( 6.4,    3.4, "Gulf of Guinea / Nigeria coast"),
+    (-6.2,  106.8, "Java Sea / Indonesia coast"),
+    (18.5,  -69.9, "Caribbean Sea"),
+    (-23.0, -43.2, "South Atlantic / Brazil coast"),
+    (38.2,   15.6, "Mediterranean Sea / Italy"),
+    (10.5,  -66.9, "Caribbean / Venezuela coast"),
+    (32.0, -141.0, "North Pacific Garbage Patch"),
+    (-32.0, -88.0, "South Pacific Gyre"),
+    (28.0,  -63.0, "Sargasso Sea / North Atlantic Gyre"),
+    (-26.0,  76.0, "Indian Ocean Gyre"),
+]
+
+def _nearest_source(lat: float, lon: float) -> str:
+    best_d, best_l = float("inf"), "Open Ocean"
+    for slat, slon, label in _SOURCE_LABELS:
+        d = ((lat - slat) ** 2 + (lon - slon) ** 2) ** 0.5
+        if d < best_d:
+            best_d, best_l = d, label
+    return best_l if best_d < 40 else "Open Ocean Accumulation"
+
+
+def _traj_503():
+    raise HTTPException(
+        status_code=503,
+        detail="Trajectory data not available. Run: python -m src.simulation.trajectory_simulator"
+    )
+
+
+@app.get("/trajectories/current", tags=["Trajectory"])
+def get_trajectory_current() -> dict[str, Any]:
+    """
+    Return current particle positions (snapshot index 0 of each trajectory).
+    Includes status breakdown: active / beached / converging.
+    """
+    if not state.trajectory_ready or state.trajectories is None:
+        _traj_503()
+
+    traj = state.trajectories           # (N, 14, 5)
+    snap0 = traj[:, 0, :]              # current positions = day-0 snapshot
+
+    particles_out = []
+    for i in range(len(snap0)):
+        lat, lon, density, age, src = (
+            float(snap0[i, 0]), float(snap0[i, 1]),
+            float(snap0[i, 2]), float(snap0[i, 3]),
+            int(snap0[i, 4]),
+        )
+        particles_out.append({
+            "id":           i,
+            "lat":          round(lat, 4),
+            "lon":          round(lon, 4),
+            "density":      round(density, 4),
+            "age_days":     round(age, 1),
+            "source_type":  src,
+            "source_label": _nearest_source(lat, lon),
+        })
+
+    src_arr  = snap0[:, 4].astype(int)
+    n_active = int((src_arr == 0).sum())
+    n_beach  = int((src_arr == 1).sum())
+    n_conv   = int((src_arr == 2).sum())
+
+    return {
+        "day":             0,
+        "total_particles": len(particles_out),
+        "active":          n_active,
+        "beached":         n_beach,
+        "converging":      n_conv,
+        "particles":       particles_out,
+    }
+
+
+@app.get("/trajectories/forecast", tags=["Trajectory"])
+def get_trajectory_forecast(max_particles: int = 2000) -> dict[str, Any]:
+    """
+    Return full 90-day trajectory for each particle as a list of 14 snapshots.
+    Each snapshot: [lat, lon, density, age_days, source_type].
+    Capped to max_particles highest-density particles for bandwidth.
+    """
+    if not state.trajectory_ready or state.trajectories is None:
+        _traj_503()
+
+    traj = state.trajectories           # (N, 14, 5)
+    N    = len(traj)
+
+    # Rank by initial density, cap to max_particles
+    init_density = traj[:, 0, 2]
+    if N > max_particles:
+        top_idx = np.argpartition(init_density, -max_particles)[-max_particles:]
+    else:
+        top_idx = np.arange(N)
+
+    traj_sub = traj[top_idx]
+    out_trajs = []
+    for j, i in enumerate(top_idx):
+        snaps = traj_sub[j]
+        lat0, lon0 = float(snaps[0, 0]), float(snaps[0, 1])
+        out_trajs.append({
+            "id":     int(i),
+            "origin": {"lat": round(lat0, 4), "lon": round(lon0, 4)},
+            "source_label": _nearest_source(lat0, lon0),
+            "snapshots": [
+                [round(float(s[0]), 4), round(float(s[1]), 4),
+                 round(float(s[2]), 4), round(float(s[3]), 1),
+                 int(s[4])]
+                for s in snaps
+            ],
+        })
+
+    return {
+        "snapshot_days":    _SNAPSHOT_DAYS,
+        "total_particles":  N,
+        "trajectories":     out_trajs,
+    }
+
+
+@app.get("/trajectories/heatmap", tags=["Trajectory"])
+def get_trajectory_heatmap(day: int = 0) -> dict[str, Any]:
+    """
+    Return 2-D density grid (720×1440) for the snapshot nearest to `day`.
+    Each occupied cell: {lat, lon, density}.
+    """
+    if not state.trajectory_ready or state.trajectories is None:
+        _traj_503()
+
+    # Find nearest snapshot index
+    snap_idx = int(np.argmin([abs(d - day) for d in _SNAPSHOT_DAYS]))
+    traj      = state.trajectories       # (N, 14, 5)
+    snap      = traj[:, snap_idx, :]    # (N, 5)
+
+    n_lat, n_lon = 720, 1440
+    grid = np.zeros((n_lat, n_lon), dtype=np.float32)
+
+    lats = snap[:, 0]
+    lons = snap[:, 1]
+    dens = snap[:, 2]
+
+    il = np.clip(
+        np.round((lats + 90  - RESOLUTION / 2) / RESOLUTION).astype(int), 0, n_lat - 1
+    )
+    jl = np.clip(
+        np.round((lons + 180 - RESOLUTION / 2) / RESOLUTION).astype(int), 0, n_lon - 1
+    )
+    np.add.at(grid, (il, jl), dens)
+
+    # Normalise
+    if grid.max() > 0:
+        grid /= grid.max()
+
+    # Return only non-zero cells for efficiency
+    ri, ci = np.where(grid > 0.005)
+    nodes_out = [
+        {
+            "lat":     round(float(-89.875 + ri[k] * RESOLUTION), 4),
+            "lon":     round(float(-179.875 + ci[k] * RESOLUTION), 4),
+            "density": round(float(grid[ri[k], ci[k]]), 4),
+        }
+        for k in range(len(ri))
+    ]
+
+    return {
+        "day":          _SNAPSHOT_DAYS[snap_idx],
+        "snapshot_idx": snap_idx,
+        "nodes":        nodes_out,
+    }
+
+
+@app.get("/trajectories/beaching-risk", tags=["Trajectory"])
+def get_beaching_risk(top_n: int = 200) -> dict[str, Any]:
+    """
+    Return top-N coastal cells ranked by cumulative incoming debris probability.
+    """
+    if not state.trajectory_ready or state.trajectories is None:
+        _traj_503()
+
+    if state.beaching_risk is None:
+        return {"top_cells": [], "total_beached": 0}
+
+    risk = state.beaching_risk          # (720, 1440)
+
+    # Count beached particles from final snapshot
+    final_snap = state.trajectories[:, -1, :]
+    total_beached = int((final_snap[:, 4] == 1).sum())
+
+    # Find top-N risk cells
+    flat = risk.flatten()
+    if len(flat) > top_n:
+        top_flat = np.argpartition(flat, -top_n)[-top_n:]
+    else:
+        top_flat = np.where(flat > 0)[0]
+
+    top_flat = top_flat[flat[top_flat] > 0]
+    ri = top_flat // 1440
+    ci = top_flat % 1440
+
+    cells = [
+        {
+            "lat":            round(float(-89.875 + ri[k] * RESOLUTION), 4),
+            "lon":            round(float(-179.875 + ci[k] * RESOLUTION), 4),
+            "risk":           round(float(risk[ri[k], ci[k]]), 4),
+            "particle_count": round(float(risk[ri[k], ci[k]] * total_beached), 0),
+        }
+        for k in range(len(ri))
+    ]
+    cells.sort(key=lambda x: x["risk"], reverse=True)
+
+    return {
+        "top_cells":     cells[:top_n],
+        "total_beached": total_beached,
+    }
+
+
+@app.post("/trajectories/seed", tags=["Trajectory"])
+def seed_custom_particle(body: SeedRequest) -> dict[str, Any]:
+    """
+    Inject a custom debris point and return its 90-day predicted trajectory.
+    Runs a single-particle physics simulation on-the-fly (~1 second).
+    """
+    if state.land_mask is None or state.currents is None:
+        raise HTTPException(status_code=503, detail="Ocean data not loaded.")
+
+    from src.simulation.trajectory_simulator import TrajectorySimulator, SNAPSHOT_DAYS
+
+    n_lat = int(180 / RESOLUTION)
+    n_lon = int(360 / RESOLUTION)
+    lats_grid = np.linspace(-90 + RESOLUTION / 2,  90 - RESOLUTION / 2, n_lat, dtype=np.float32)
+    lons_grid = np.linspace(-180 + RESOLUTION / 2, 180 - RESOLUTION / 2, n_lon, dtype=np.float32)
+
+    winds = np.zeros((n_lat, n_lon, 2), dtype=np.float32)
+    wind_path = DATA_DIR / "wind_data.npy"
+    if wind_path.exists():
+        winds = np.load(str(wind_path))
+
+    sim = TrajectorySimulator(
+        state.land_mask.astype(bool), state.currents, winds,
+        lats_grid, lons_grid, rng_seed=0
+    )
+
+    seed = np.array([[body.lat, body.lon, min(1.0, body.mass_kg / 1000.0)]], dtype=np.float32)
+    try:
+        traj, _ = sim.run(seed, n_days=90)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Simulation failed: {exc}")
+
+    snaps = traj[0]   # (14, 5) for the single particle
+    final_src = int(snaps[-1, 4])
+    status_map = {0: "active", 1: "beached", 2: "converging"}
+
+    return {
+        "origin":        {"lat": body.lat, "lon": body.lon, "mass_kg": body.mass_kg},
+        "snapshot_days": _SNAPSHOT_DAYS,
+        "trajectory":    [
+            [round(float(s[0]), 4), round(float(s[1]), 4),
+             round(float(s[2]), 4), round(float(s[3]), 1),
+             int(s[4])]
+            for s in snaps
+        ],
+        "final_status":  status_map.get(final_src, "active"),
+    }
