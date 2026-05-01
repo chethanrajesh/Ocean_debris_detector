@@ -270,16 +270,14 @@ def fetch_aoml_seeds(
     force_refresh: bool = False,
 ) -> np.ndarray:
     """
-    Produce debris seed nodes from real AOML GDP drifter data.
+    Produce debris seed nodes from real observed data.
 
     Priority:
-    1. AOML GDP 6-hourly NetCDF (gdp6h_ragged_current.nc) — real drifter positions
-    2. AOML GDP .dat.gz files — same data, different format
-    3. Literature-based fallback (Lebreton 2018, Eriksen 2014, van Sebille 2015)
-
-    The drifter density per 0.25° cell is used as a proxy for debris
-    accumulation — drifters and floating plastic follow the same ocean currents
-    and accumulate in the same convergence zones (gyres).
+    1. NOAA NCEI Marine Microplastics Database (22,530 in-situ observations,
+       1972–present) via ArcGIS REST API — the most comprehensive real dataset
+    2. AOML GDP 6-hourly NetCDF (gdp6h_ragged_current.nc) — real drifter positions
+    3. AOML GDP .dat.gz files — same data, different format
+    4. Literature-based fallback (Lebreton 2018, Eriksen 2014, van Sebille 2015)
 
     Returns (N, 3) float32  [lat, lon, concentration_normalised_0_1]
     """
@@ -291,13 +289,26 @@ def fetch_aoml_seeds(
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     df = None
 
-    # ── Try 1: GDP NetCDF ─────────────────────────────────────────────────────
-    logger.info("Attempting AOML GDP NetCDF (primary source)...")
+    # ── Try 1: NCEI Marine Microplastics Database (primary — real observations) ─
+    logger.info("Attempting NOAA NCEI Marine Microplastics Database (primary source)...")
+    try:
+        from src.data_pipeline.fetch_ncei import fetch_ncei_microplastics
+        ncei_seeds = fetch_ncei_microplastics(surface_only=True, force_refresh=force_refresh)
+        if len(ncei_seeds) >= 100:
+            logger.info(f"NCEI source: {len(ncei_seeds):,} seed nodes")
+            np.save(str(out_path), ncei_seeds)
+            logger.info(f"Saved {len(ncei_seeds):,} NCEI seed nodes → {out_path}")
+            return ncei_seeds
+    except Exception as exc:
+        logger.warning(f"NCEI fetch failed: {exc}")
+
+    # ── Try 2: GDP NetCDF ─────────────────────────────────────────────────────
+    logger.info("Attempting AOML GDP NetCDF (secondary source)...")
     df = _fetch_gdp_netcdf(max_mb=30)
 
-    # ── Try 2: GDP .dat.gz ────────────────────────────────────────────────────
+    # ── Try 3: GDP .dat.gz ────────────────────────────────────────────────────
     if df is None or len(df) < 100:
-        logger.info("Attempting AOML GDP .dat.gz (secondary source)...")
+        logger.info("Attempting AOML GDP .dat.gz (tertiary source)...")
         df = _fetch_gdp_dat_gz()
 
     # ── Fallback: literature database ─────────────────────────────────────────

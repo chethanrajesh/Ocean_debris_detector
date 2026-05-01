@@ -80,8 +80,14 @@ def run_pipeline(
     results["ssh_currents"] = ok
 
     # ── Step 4: AOML debris seeds ─────────────────────────────────────────────
+    from src.data_pipeline.fetch_ncei import fetch_ncei_microplastics
+    ok, _ = _step("NCEI Marine Microplastics (primary seeds)", fetch_ncei_microplastics,
+                  force_refresh=force_refresh)
+    results["ncei"] = ok
+
     from src.data_pipeline.fetch_aoml import fetch_aoml_seeds
-    ok, _ = _step("AOML debris seeds", fetch_aoml_seeds, force_refresh=force_refresh)
+    ok, _ = _step("AOML debris seeds (with NCEI fallback)", fetch_aoml_seeds,
+                  force_refresh=force_refresh)
     results["aoml"] = ok
 
     # ── Step 5: Sentinel-2 via GEE ────────────────────────────────────────────

@@ -286,104 +286,6 @@ class TrajectorySimulator:
         return snapshots, beach_risk
 
 
-# ── Synthetic field generators ────────────────────────────────────────────────
-
-def _synthetic_currents(
-    lats_grid: np.ndarray,
-    lons_grid: np.ndarray,
-    land_mask: np.ndarray,
-) -> np.ndarray:
-    """
-    Generate synthetic but physically-motivated surface ocean currents.
-
-    Models 5 major subtropical gyres + the Antarctic Circumpolar Current.
-    Each gyre is a clockwise (NH) or counter-clockwise (SH) vortex.
-    Peak current speed ≈ 0.3 m/s at gyre core, falling off with Gaussian distance.
-    """
-    n_lat, n_lon = len(lats_grid), len(lons_grid)
-    u = np.zeros((n_lat, n_lon), dtype=np.float32)
-    v = np.zeros((n_lat, n_lon), dtype=np.float32)
-
-    lon_grid, lat_grid = np.meshgrid(lons_grid, lats_grid)
-
-    # (centre_lat, centre_lon, radius_deg, peak_speed_ms, cw=clockwise)
-    gyres = [
-        ( 32.0, -140.0, 30.0, 0.30, True),   # North Pacific
-        (-28.0, -100.0, 25.0, 0.22, False),   # South Pacific
-        ( 30.0,  -40.0, 28.0, 0.25, True),    # North Atlantic
-        (-28.0,  -15.0, 24.0, 0.20, False),   # South Atlantic
-        (-28.0,   75.0, 26.0, 0.20, False),   # Indian Ocean
-    ]
-
-    for clat, clon, rad, speed, cw in gyres:
-        dlat = lat_grid - clat
-        dlon = lon_grid - clon
-        # Wrap longitude
-        dlon = np.where(dlon >  180, dlon - 360, dlon)
-        dlon = np.where(dlon < -180, dlon + 360, dlon)
-
-        dist = np.sqrt(dlat**2 + dlon**2)
-        # Gaussian envelope: max at 0.5*radius, zero at core & far edge
-        envelope = (dist / rad) * np.exp(-0.5 * (dist / rad)**2) * 2.718
-        envelope = np.clip(envelope, 0, 1) * speed
-
-        # Tangential direction (perpendicular to radial, ±CW/CCW)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            norm = np.where(dist > 0.01, dist, 0.01)
-            rdlat = dlat / norm
-            rdlon = dlon / norm
-
-        sign = -1.0 if cw else 1.0
-        u += sign * rdlat * envelope
-        v += sign * (-rdlon) * envelope
-
-    # Antarctic Circumpolar Current — constant eastward flow below -45°
-    acc_mask = lat_grid < -45
-    acc_speed = 0.25 * np.exp(((lat_grid + 60) / 15) ** 2 * -0.5)
-    u[acc_mask] += acc_speed[acc_mask]
-
-    # Apply land mask
-    u[~land_mask] = 0.0
-    v[~land_mask] = 0.0
-
-    return np.stack([u, v], axis=-1).astype(np.float32)
-
-
-def _synthetic_winds(
-    lats_grid: np.ndarray,
-    lons_grid: np.ndarray,
-) -> np.ndarray:
-    """
-    Generate synthetic global surface wind fields.
-    Models trade winds (equatorial), westerlies (mid-lat), polar easterlies.
-    Peak speed ≈ 6-8 m/s.
-    """
-    n_lat, n_lon = len(lats_grid), len(lons_grid)
-    u = np.zeros((n_lat, n_lon), dtype=np.float32)
-    v = np.zeros((n_lat, n_lon), dtype=np.float32)
-
-    lon_grid, lat_grid = np.meshgrid(lons_grid, lats_grid)
-    lat_rad = np.radians(lat_grid)
-
-    # Hadley cell / trade winds: easterly 0–30° each hemisphere
-    trade_u = -7.0 * np.sin(2 * lat_rad) * np.exp(-(lat_grid / 15)**2)
-    u += trade_u
-
-    # Ferrel cell: westerly 30–60°
-    westerly_u = 6.0 * np.sin(np.pi * (np.abs(lat_grid) - 30) / 60)
-    westerly_u = np.where((np.abs(lat_grid) > 30) & (np.abs(lat_grid) < 70), westerly_u, 0.0)
-    u += westerly_u
-
-    # Polar easterlies: poleward of 70°
-    polar_u = -3.0 * np.where(np.abs(lat_grid) > 70, 1.0, 0.0)
-    u += polar_u
-
-    # Small meridional component (convergence zones)
-    v = -2.5 * np.sin(lat_rad) * np.cos(lat_rad)
-
-    return np.stack([u, v], axis=-1).astype(np.float32)
-
-
 # ── Convenience runner ────────────────────────────────────────────────────────
 
 def run_trajectory_simulation(
@@ -419,15 +321,16 @@ def run_trajectory_simulation(
     currents  = _load("ocean_currents.npy",  (n_lat, n_lon, 2))
     winds     = _load("wind_data.npy",       (n_lat, n_lon, 2))
 
-    # ── Synthetic current fallback ────────────────────────────────────────────
-    # If real currents are all-zero (credentials not available), generate
-    # physically-motivated synthetic ocean circulation.
     if np.abs(currents).max() < 1e-6:
-        logger.warning("ocean_currents.npy is all-zero. Generating synthetic circulation fields.")
-        currents = _synthetic_currents(lats_grid, lons_grid, land_mask)
+        raise RuntimeError(
+            "ocean_currents.npy is all-zero. Run the data pipeline first: "
+            "python -m src.data_pipeline.fetch_cmems"
+        )
     if np.abs(winds).max() < 1e-6:
-        logger.warning("wind_data.npy is all-zero. Generating synthetic trade-wind fields.")
-        winds = _synthetic_winds(lats_grid, lons_grid)
+        raise RuntimeError(
+            "wind_data.npy is all-zero. Run the data pipeline first: "
+            "python -m src.data_pipeline.fetch_noaa"
+        )
 
     # ── Load seed nodes ───────────────────────────────────────────────────────
     seeds = load_aoml_seeds()

@@ -1,21 +1,17 @@
 """
 fetch_noaa.py
-Fetches wind and buoy data from working public sources:
+Fetches wind and geostrophic current data from working public sources:
 
-  1. Wind fields  — Open-Meteo API (free, no auth, global 0.25° grid)
-                    Fallback: CMEMS anfc wind stress (usi/vsi)
-  2. Geostrophic currents (backup for CMEMS) — CoastWatch nesdisSSH1day
-  3. GDP buoy trajectories — CoastWatch ERDDAP tabledap
+  1. Wind fields          — Open-Meteo API (free, no auth, global 0.25° grid)
+  2. Geostrophic currents — CoastWatch nesdisSSH1day (SSH altimetry, backup for CMEMS)
 
 Output
 ------
-data/wind_data.npy          : (720, 1440, 2) float32  [u10, v10] m/s
-data/ocean_currents.npy     : (720, 1440, 2) float32  [u, v]  (SSH geostrophic, backup only)
-data/buoy_trajectories.pkl  : DataFrame with buoy tracks
+data/wind_data.npy     : (720, 1440, 2) float32  [u10, v10] m/s
+data/ssh_currents.npy  : (720, 1440, 2) float32  [u, v] m/s  (geostrophic backup)
 """
 import io
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -243,80 +239,14 @@ def fetch_ssh_geostrophic_currents(force_refresh: bool = False) -> np.ndarray:
         return np.zeros((n_lat, n_lon, 2), dtype=np.float32)
 
 
-# ── 3. GDP Drifter Buoys ──────────────────────────────────────────────────────
-
-def fetch_gdp_trajectories(force_refresh: bool = False) -> pd.DataFrame:
-    """
-    Download NOAA GDP drifter buoy trajectories.
-    Tries CoastWatch ERDDAP; falls back to synthetic data if unavailable.
-    """
-    cache = DATA_DIR / "buoy_trajectories.pkl"
-    if cache.exists() and not force_refresh:
-        logger.info(f"Loading cached GDP trajectories from {cache}")
-        return pd.read_pickle(str(cache))
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    now      = datetime.now(timezone.utc)
-    end_dt   = now
-    start_dt = now - timedelta(days=60)
-
-    # Try multiple ERDDAP endpoints
-    endpoints = [
-        (
-            "https://coastwatch.pfeg.noaa.gov/erddap/tabledap/gdp_hourly_velocities.csv"
-            "?ID,time,latitude,longitude,u,v,temp"
-            f"&time>={start_dt.strftime('%Y-%m-%dT00:00:00Z')}"
-            f"&time<={end_dt.strftime('%Y-%m-%dT00:00:00Z')}"
-            "&orderBy(%22ID,time%22)"
-        ),
-    ]
-
-    for url in endpoints:
-        try:
-            logger.info(f"Fetching GDP buoys from ERDDAP...")
-            resp = requests.get(url, timeout=120)
-            resp.raise_for_status()
-            lines = resp.text.splitlines()
-            cleaned = "\n".join([lines[0]] + lines[2:])
-            df = pd.read_csv(io.StringIO(cleaned), parse_dates=["time"])
-            df = df.rename(columns={
-                "ID": "buoy_id", "time": "timestamp",
-                "latitude": "lat", "longitude": "lon",
-                "temp": "sst", "u": "u_obs", "v": "v_obs",
-            })
-            df = df[["buoy_id", "timestamp", "lat", "lon", "u_obs", "v_obs", "sst"]].copy()
-            df.to_pickle(str(cache))
-            logger.info(f"Saved {len(df):,} buoy records → {cache}")
-            return df
-        except Exception as exc:
-            logger.warning(f"GDP ERDDAP failed: {exc}")
-
-    # Synthetic fallback
-    logger.warning("GDP fetch failed — generating synthetic buoy data for GNN training")
-    rng = np.random.default_rng(42)
-    n = 5000
-    df_syn = pd.DataFrame({
-        "buoy_id":   rng.integers(1000, 9999, n),
-        "timestamp": pd.date_range(start_dt, periods=n, freq="6h"),
-        "lat":       rng.uniform(-60, 60, n),
-        "lon":       rng.uniform(-180, 180, n),
-        "u_obs":     rng.normal(0, 0.2, n),
-        "v_obs":     rng.normal(0, 0.15, n),
-        "sst":       rng.uniform(15, 30, n),
-    })
-    df_syn.to_pickle(str(cache))
-    return df_syn
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def fetch_and_save_all(force_refresh: bool = False) -> None:
-    """Fetch winds, SSH currents, and GDP buoys; save all outputs."""
+    """Fetch winds and SSH currents; save all outputs."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     fetch_openmeteo_winds(force_refresh=force_refresh)
     fetch_ssh_geostrophic_currents(force_refresh=force_refresh)
-    fetch_gdp_trajectories(force_refresh=force_refresh)
 
     logger.info("fetch_noaa.py complete.")
 
