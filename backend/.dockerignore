@@ -1,0 +1,16 @@
+# Don't send large data files into the build context
+# (they're mounted as a volume at runtime anyway)
+data/
+__pycache__/
+*.pyc
+*.pyo
+.git
+*.log
+*.txt.bak
+test_*.py
+find_datasets.py
+probe_network.py
+cmems_err.txt
+fetch_noaa_err.txt
+noaa.log
+.env

@@ -33,6 +33,7 @@ const LegendPanel        = dynamic(() => import("@/components/LegendPanel"),    
 const TrajectoryLayer    = dynamic(() => import("@/components/TrajectoryLayer"),    { ssr: false });
 const BeachingRiskLayer  = dynamic(() => import("@/components/BeachingRiskLayer"), { ssr: false });
 const TrajectoryPanel    = dynamic(() => import("@/components/TrajectoryPanel"),    { ssr: false });
+import Draggable from "@/components/Draggable";
 
 // ── Dashboard mode ───────────────────────────────────────────────────────────
 type DashboardMode = "hotspot" | "trajectory";
@@ -397,6 +398,13 @@ export default function DashboardPage() {
 
         {/* API status + refresh */}
         <div className="flex items-center gap-3">
+          {/* Mode banner inline in navbar */}
+          <div className="mr-3">
+            {dashMode === "hotspot"
+              ? <ModeBanner mode={mode} day={predDay} />
+              : <TrajModeBanner snapshotIdx={snapshotIdx} />
+            }
+          </div>
           <div className="flex items-center gap-1.5">
             <div className={`w-2 h-2 rounded-full ${
               apiStatus === "ok" ? "bg-green-500" : apiStatus === "error" ? "bg-red-500" : "bg-amber-500 animate-pulse"
@@ -414,120 +422,124 @@ export default function DashboardPage() {
         </div>
       </header>
 
-      {/* ── Mode banner (top-centre) ── */}
-      <div className="absolute top-16 left-1/2 -translate-x-1/2 z-10">
-        {dashMode === "hotspot"
-          ? <ModeBanner mode={mode} day={predDay} />
-          : <TrajModeBanner snapshotIdx={snapshotIdx} />
-        }
-      </div>
+      {/* Mode banner removed from below navbar — now lives inside navbar */}
 
-      {/* ── HOTSPOT STATS (top-left) ── */}
+      {/* ── HOTSPOT STATS (top-left, below navbar) ── */}
       {dashMode === "hotspot" && (
-        <div className="absolute top-16 left-4 z-10 flex flex-col gap-2 animate-fade-in-up">
-          <StatCard id="stat-critical" label="Critical Zones"  value={loading ? "—" : String(criticalCount)}                   icon={Zap}      color="#ef4444" />
-          <StatCard id="stat-high"     label="High Risk Zones" value={loading ? "—" : String(highCount)}                       icon={Activity} color="#f97316" />
-          <StatCard id="stat-density"  label="Peak Density"    value={loading ? "—" : `${maxDensity.toFixed(1)}%`}             icon={Waves}    color="#00d4c8" />
-          <StatCard id="stat-coverage" label="Tracked Area"    value={loading ? "—" : `${(trackedKm2 / 1000).toFixed(0)}K km²`} icon={Globe2} color="#3b82f6" />
+        <div className="absolute left-4 z-10 flex flex-col gap-2 animate-fade-in-up" style={{ top: 68 }}>
+          <StatCard id="stat-critical" label="Critical Zones"  value={loading ? "—" : String(criticalCount)}                     icon={Zap}      color="#ef4444" />
+          <StatCard id="stat-high"     label="High Risk Zones" value={loading ? "—" : String(highCount)}                         icon={Activity} color="#f97316" />
+          <StatCard id="stat-density"  label="Peak Density"    value={loading ? "—" : `${maxDensity.toFixed(1)}%`}               icon={Waves}    color="#00d4c8" />
+          <StatCard id="stat-coverage" label="Tracked Area"    value={loading ? "—" : `${(trackedKm2 / 1000).toFixed(0)}K km²`} icon={Globe2}   color="#3b82f6" />
         </div>
       )}
 
-      {/* ── TRAJECTORY STATS (top-left) ── */}
+      {/* ── TRAJECTORY STATS (top-left, below navbar) ── */}
       {dashMode === "trajectory" && (
-        <div className="absolute top-16 left-4 z-10 flex flex-col gap-2 animate-fade-in-up">
-          <StatCard id="stat-particles" label="Active Particles"  value={trajLoading ? "—" : String(trajStats.active)}               icon={Waves}      color="#00d4c8" />
-          <StatCard id="stat-beached"   label="Beaching Events"   value={trajLoading ? "—" : String(trajStats.beached)}              icon={Anchor}     color="#ef4444" />
-          <StatCard id="stat-total"     label="Total Tracked"     value={trajLoading ? "—" : String(trajStats.total)}                 icon={Globe2}     color="#3b82f6" />
-          <StatCard id="stat-day"       label="Forecast Day"      value={`Day ${SNAPSHOT_DAYS[snapshotIdx] ?? 0}`}                   icon={Navigation} color="#f59e0b" />
+        <div className="absolute left-4 z-10 flex flex-col gap-2 animate-fade-in-up" style={{ top: 68 }}>
+          <StatCard id="stat-particles" label="Active Particles" value={trajLoading ? "—" : String(trajStats.active)}  icon={Waves}      color="#00d4c8" />
+          <StatCard id="stat-beached"   label="Beaching Events"  value={trajLoading ? "—" : String(trajStats.beached)} icon={Anchor}     color="#ef4444" />
+          <StatCard id="stat-total"     label="Total Tracked"    value={trajLoading ? "—" : String(trajStats.total)}   icon={Globe2}     color="#3b82f6" />
+          <StatCard id="stat-day"       label="Forecast Day"     value={`Day ${SNAPSHOT_DAYS[snapshotIdx] ?? 0}`}      icon={Navigation} color="#f59e0b" />
         </div>
       )}
 
-      {/* ── Hotspot panel (right) ── */}
+      {/* ── Hotspot panel — floats top-right, clear of navbar ── */}
       {dashMode === "hotspot" && selectedHotspot && (
-        <div className="absolute top-16 right-4 z-20">
+        <Draggable id="hotspot-panel-float" defaultPosition={() => ({ x: window.innerWidth - 356, y: 68 })}>
           <HotspotPanel hotspot={selectedHotspot} onClose={() => setSelected(null)} />
-        </div>
+        </Draggable>
       )}
 
-      {/* ── Trajectory panel (right) ── */}
+      {/* ── Trajectory panel — floats top-right, clear of navbar ── */}
       {dashMode === "trajectory" && selectedTraj && (
-        <div className="absolute top-16 right-4 z-20">
+        <Draggable id="trajectory-panel-float" defaultPosition={() => ({ x: window.innerWidth - 316, y: 68 })}>
           <TrajectoryPanel
             trajectory={selectedTraj}
             snapshotIdx={snapshotIdx}
             onClose={() => setSelectedTraj(null)}
           />
-        </div>
+        </Draggable>
       )}
 
-      {/* ── HOTSPOT TIME SLIDER (bottom-centre) ── */}
+      {/* ── HOTSPOT TIME SLIDER — floats bottom-centre ── */}
       {dashMode === "hotspot" && (
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10">
+        <Draggable id="time-slider-float" defaultPosition={() => ({
+          x: Math.round(window.innerWidth / 2) - 230,
+          y: window.innerHeight - 120,
+        })}>
           <TimeSlider value={timestep} maxSteps={maxSteps} onChange={handleTimestepChange} mode={mode} />
-        </div>
+        </Draggable>
       )}
 
-      {/* ── TRAJECTORY TIMELINE (bottom-centre) ── */}
+      {/* ── TRAJECTORY TIMELINE — floats bottom-centre ── */}
       {dashMode === "trajectory" && (
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10">
+        <Draggable id="traj-timeline-float" defaultPosition={() => ({
+          x: Math.round(window.innerWidth / 2) - 210,
+          y: window.innerHeight - 130,
+        })}>
           <div style={{
-            display: "flex", alignItems: "center", gap: 12,
-            padding: "12px 20px", borderRadius: 16,
-            background: "rgba(4,15,28,0.88)", backdropFilter: "blur(12px)",
-            border: "1px solid rgba(0,212,200,0.18)",
-            boxShadow: "0 4px 24px rgba(0,0,0,0.4)",
-          }}>
-            {/* Play/pause */}
-            <button
-              id="traj-play-btn"
-              onClick={() => { setIsPlaying(p => !p); if (snapshotIdx >= SNAPSHOT_DAYS.length - 1) setSnapshotIdx(0); }}
-              style={{
-                width: 32, height: 32, borderRadius: 9,
-                background: "rgba(0,212,200,0.18)", border: "1px solid rgba(0,212,200,0.4)",
-                cursor: "pointer", color: "#00d4c8",
-                display: "flex", alignItems: "center", justifyContent: "center",
-              }}>
-              {isPlaying ? <Pause size={14} /> : <Play size={14} />}
-            </button>
+              display: "flex", alignItems: "center", gap: 12,
+              padding: "12px 20px", borderRadius: 16,
+              background: "rgba(4,15,28,0.88)", backdropFilter: "blur(12px)",
+              border: "1px solid rgba(0,212,200,0.18)",
+              boxShadow: "0 4px 24px rgba(0,0,0,0.4)",
+            }}>
+              {/* Play/pause */}
+              <button
+                id="traj-play-btn"
+                onClick={() => { setIsPlaying(p => !p); if (snapshotIdx >= SNAPSHOT_DAYS.length - 1) setSnapshotIdx(0); }}
+                style={{
+                  width: 32, height: 32, borderRadius: 9,
+                  background: "rgba(0,212,200,0.18)", border: "1px solid rgba(0,212,200,0.4)",
+                  cursor: "pointer", color: "#00d4c8",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                {isPlaying ? <Pause size={14} /> : <Play size={14} />}
+              </button>
 
-            {/* Timeline label */}
-            <span style={{ fontSize: 10, color: "var(--text-muted)", whiteSpace: "nowrap" }}>
-              TIME PROJECTION
-            </span>
+              {/* Timeline label */}
+              <span style={{ fontSize: 10, color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+                TIME PROJECTION
+              </span>
 
-            {/* Scrubber */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 280 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-                <span style={{ fontSize: 9, color: "#64748b" }}>Day 0</span>
-                <span style={{ fontSize: 9, color: "#00d4c8", fontWeight: 700 }}>
-                  Day {SNAPSHOT_DAYS[snapshotIdx]}
-                </span>
-                <span style={{ fontSize: 9, color: "#64748b" }}>Day 90</span>
-              </div>
-              <input
-                id="traj-slider"
-                type="range"
-                min={0}
-                max={SNAPSHOT_DAYS.length - 1}
-                value={snapshotIdx}
-                onChange={e => { setSnapshotIdx(Number(e.target.value)); setIsPlaying(false); }}
-                style={{ width: "100%", accentColor: "#00d4c8", cursor: "pointer" }}
-              />
-              {/* Tick marks */}
-              <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 2 }}>
-                {SNAPSHOT_DAYS.filter((_, i) => i % 2 === 0).map(d => (
-                  <span key={d} style={{ fontSize: 8, color: "#334155" }}>{d}</span>
-                ))}
+              {/* Scrubber */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 280 }}
+                   onPointerDown={(e) => e.stopPropagation()} /* Prevent dragging while using slider */>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                  <span style={{ fontSize: 9, color: "#64748b" }}>Day 0</span>
+                  <span style={{ fontSize: 9, color: "#00d4c8", fontWeight: 700 }}>
+                    Day {SNAPSHOT_DAYS[snapshotIdx]}
+                  </span>
+                  <span style={{ fontSize: 9, color: "#64748b" }}>Day 90</span>
+                </div>
+                <input
+                  id="traj-slider"
+                  type="range"
+                  min={0}
+                  max={SNAPSHOT_DAYS.length - 1}
+                  value={snapshotIdx}
+                  onChange={e => { setSnapshotIdx(Number(e.target.value)); setIsPlaying(false); }}
+                  style={{ width: "100%", accentColor: "#00d4c8", cursor: "pointer" }}
+                />
+                {/* Tick marks */}
+                <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 2 }}>
+                  {SNAPSHOT_DAYS.filter((_, i) => i % 2 === 0).map(d => (
+                    <span key={d} style={{ fontSize: 8, color: "#334155" }}>{d}</span>
+                  ))}
+                </div>
               </div>
             </div>
-          </div>
-        </div>
+          </Draggable>
       )}
 
-      {/* ── Legend (bottom-left) ── */}
-      <div className="absolute bottom-6 left-4 z-10">
+      {/* ── Legend — floats bottom-left, above time slider ── */}
+      <Draggable id="legend-float" defaultPosition={() => ({
+        x: 16,
+        y: window.innerHeight - 260,
+      })}>
         <LegendPanel />
-      </div>
+      </Draggable>
 
       {/* ── Loading overlay ── */}
       {(loading || (dashMode === "trajectory" && trajLoading)) && (

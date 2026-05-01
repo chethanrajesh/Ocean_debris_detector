@@ -45,6 +45,8 @@ export default function TrajectoryPanel({ trajectory, snapshotIdx, onClose }: Pr
       id="trajectory-panel"
       style={{
         width: 280,
+        maxHeight: "calc(100vh - 200px)",
+        overflowY: "auto",
         background: "rgba(4, 15, 28, 0.92)",
         backdropFilter: "blur(16px)",
         border: "1px solid rgba(0, 212, 200, 0.15)",

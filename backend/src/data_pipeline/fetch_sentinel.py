@@ -1,32 +1,23 @@
 """
 fetch_sentinel.py
-Authenticates to Google Earth Engine (GEE) using a service account,
-retrieves Sentinel-2 MSI SR Harmonized imagery over ocean regions,
-computes the Floating Debris Index (FDI) and Plastic Index (PI),
-and saves per-node debris probability scores.
+Computes Floating Debris Index (FDI) and Plastic Index (PI) from
+Sentinel-2 MSI SR Harmonized imagery via Google Earth Engine.
 
-Band wavelength centres used in FDI formula (nm)
--------------------------------------------------
-B4  = 664.9   (Red)
-B6  = 740.2   (Red Edge 2) — note: S2-SR-Harmonized band numbering
-B8A = 864.8   (NIR narrow / Vegetation Red Edge)
-B11 = 1610.4  (SWIR-1)
-
-Floating Debris Index (Biermann et al. 2020):
+FDI (Biermann et al. 2020):
   FDI = B8A - (B6 + (B11 - B6) × ((832.9 - 664.9) / (1610.4 - 664.9)))
 
-Plastic Index (Zietsman et al. 2022):
+PI (Zietsman et al. 2022):
   PI = B4 / (B4 + B6)
 
-Environment Variables Required
--------------------------------
-GEE_SERVICE_ACCOUNT_KEY : path to GEE service account JSON key file
+Output
+------
+data/sentinel_scores.npy : (720, 1440) float32  debris probability [0, 1]
 """
-import os
-import logging
 import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timedelta
 
 import numpy as np
 from dotenv import load_dotenv
@@ -34,160 +25,162 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
+DATA_DIR   = Path(__file__).parent.parent.parent / "data"
 RESOLUTION = 0.25
 
-# Band wavelength centres (nm) — Sentinel-2 MSI
-LAMBDA_B4  = 664.9
-LAMBDA_B6  = 740.2
-LAMBDA_B8A = 864.8   # used as 832.9 in the FDI formula's linear interpolation anchor
-LAMBDA_B11 = 1610.4
-
-FDI_INTERP_FACTOR = (832.9 - LAMBDA_B4) / (LAMBDA_B11 - LAMBDA_B4)
+FDI_INTERP = (832.9 - 664.9) / (1610.4 - 664.9)
 
 
-def _init_gee() -> None:
-    """Initialize GEE with service account credentials."""
+def _init_gee():
     import ee
-    key_path = os.environ.get("GEE_SERVICE_ACCOUNT_KEY")
+    key_path = os.environ.get("GEE_SERVICE_ACCOUNT_KEY", "")
     if not key_path or not os.path.exists(key_path):
         raise EnvironmentError(
-            "GEE_SERVICE_ACCOUNT_KEY must point to a valid service account JSON file."
+            f"GEE_SERVICE_ACCOUNT_KEY not found at: {key_path}"
         )
     with open(key_path) as f:
         info = json.load(f)
-    credentials = ee.ServiceAccountCredentials(info["client_email"], key_path)
-    ee.Initialize(credentials)
+    creds = ee.ServiceAccountCredentials(info["client_email"], key_path)
+    ee.Initialize(creds)
     logger.info(f"GEE initialized as {info['client_email']}")
-
-
-def _compute_fdi_pi(image):
-    """
-    GEE server-side function: compute FDI and PI bands on a Sentinel-2 image.
-    Adds bands 'FDI' and 'PI' and returns the image.
-    """
-    import ee
-
-    # S2-SR-Harmonized band names: B4, B6, B8A, B11 (scaled 0–10000)
-    B4  = image.select("B4").toFloat().divide(10000)
-    B6  = image.select("B6").toFloat().divide(10000)
-    B8A = image.select("B8A").toFloat().divide(10000)
-    B11 = image.select("B11").toFloat().divide(10000)
-
-    fdi = B8A.subtract(
-        B6.add(B11.subtract(B6).multiply(FDI_INTERP_FACTOR))
-    ).rename("FDI")
-
-    pi = B4.divide(B4.add(B6).add(1e-6)).rename("PI")
-
-    return image.addBands(fdi).addBands(pi)
+    return ee
 
 
 def fetch_sentinel_debris_scores(
     days_back: int = 90,
-    cloud_cover_max: float = 20.0
+    cloud_cover_max: float = 20.0,
+    sample_deg: float = 2.0,
+    force_refresh: bool = False,
 ) -> np.ndarray:
     """
-    Build a global Sentinel-2 composite, compute FDI and PI,
-    and return per-node debris probability scores on a 0.25° grid.
+    Build a global Sentinel-2 FDI/PI composite and return per-cell
+    debris probability on a 0.25° grid.
 
-    Debris probability = mean of scaled FDI (0–1) and PI (0–1).
+    Parameters
+    ----------
+    days_back       : composite window in days (default 90)
+    cloud_cover_max : max cloud cover % per scene (default 20)
+    sample_deg      : sampling resolution in degrees (default 2.0 — keeps
+                      GEE quota usage low; interpolated to 0.25° after)
+    force_refresh   : re-download even if cached file exists
 
     Returns
     -------
-    scores : (N_lat, N_lon) float32 in [0, 1]
+    scores : (720, 1440) float32 in [0, 1]
     """
-    try:
-        import ee
-    except ImportError:
-        raise ImportError("earthengine-api not installed. Run: pip install earthengine-api")
+    out_path = DATA_DIR / "sentinel_scores.npy"
+    if out_path.exists() and not force_refresh:
+        logger.info(f"Loading cached Sentinel scores from {out_path}")
+        return np.load(str(out_path))
 
-    _init_gee()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    end_dt = datetime.utcnow()
-    start_dt = end_dt - timedelta(days=days_back)
-    start_str = start_dt.strftime("%Y-%m-%d")
-    end_str   = end_dt.strftime("%Y-%m-%d")
+    ee = _init_gee()
 
-    logger.info(f"Building Sentinel-2 composite {start_str} → {end_str}, cloud < {cloud_cover_max}%")
+    now      = datetime.now(timezone.utc)
+    end_str  = now.strftime("%Y-%m-%d")
+    start_str = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
-    # Load and filter collection
+    logger.info(f"Building S2 composite {start_str} → {end_str}, cloud<{cloud_cover_max}%")
+
+    def _add_indices(image):
+        B4  = image.select("B4").toFloat().divide(10000)
+        B6  = image.select("B6").toFloat().divide(10000)
+        B8A = image.select("B8A").toFloat().divide(10000)
+        B11 = image.select("B11").toFloat().divide(10000)
+        fdi = B8A.subtract(
+            B6.add(B11.subtract(B6).multiply(FDI_INTERP))
+        ).rename("FDI")
+        pi = B4.divide(B4.add(B6).add(1e-6)).rename("PI")
+        return image.addBands(fdi).addBands(pi)
+
     collection = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start_str, end_str)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_cover_max))
-        .filterBounds(ee.Geometry.Rectangle([-180, -60, 180, 60]))  # ocean extents
+        .filterBounds(ee.Geometry.Rectangle([-180, -60, 180, 60]))
         .select(["B4", "B6", "B8A", "B11"])
-        .map(_compute_fdi_pi)
+        .map(_add_indices)
     )
 
-    count = collection.size().getInfo()
-    logger.info(f"  Found {count} Sentinel-2 scenes.")
-
-    if count == 0:
-        logger.warning("No Sentinel-2 scenes found; returning zero scores.")
-        n_lat = int(180 / RESOLUTION)
-        n_lon = int(360 / RESOLUTION)
-        return np.zeros((n_lat, n_lon), dtype=np.float32)
-
-    # Median composite
     composite = collection.median()
 
-    # Sample on a 0.25° grid
-    n_lat = int(120 / RESOLUTION)   # -60 to +60
+    # Sample on a coarse grid to stay within GEE quota
+    n_lat = int(180 / RESOLUTION)
     n_lon = int(360 / RESOLUTION)
+    scores = np.zeros((n_lat, n_lon), dtype=np.float32)
 
-    sample_lats = np.linspace(-59.875, 59.875, n_lat, dtype=np.float32)
-    sample_lons = np.linspace(-179.875, 179.875, n_lon, dtype=np.float32)
+    step = max(1, int(sample_deg / RESOLUTION))
+    sample_lats = np.linspace(-59.875, 59.875, int(120 / RESOLUTION))[::step]
+    sample_lons = np.linspace(-179.875, 179.875, n_lon)[::step]
 
-    scores = np.zeros((int(180 / RESOLUTION), n_lon), dtype=np.float32)
-    lat_offset = int(30 / RESOLUTION)  # offset for -90...-60 rows
-
-    # Build GEE point feature collection (sample at every 2° to avoid quota limits)
-    step = int(2.0 / RESOLUTION)
+    # Build feature collection of sample points
     points = []
-    lat_idxs = list(range(0, n_lat, step))
-    lon_idxs = list(range(0, n_lon, step))
+    lat_indices = []
+    lon_indices = []
 
-    for li in lat_idxs:
-        for lj in lon_idxs:
-            lat = float(sample_lats[li])
-            lon = float(sample_lons[lj])
+    all_lats = np.linspace(-90 + RESOLUTION / 2, 90 - RESOLUTION / 2, n_lat)
+    all_lons = np.linspace(-180 + RESOLUTION / 2, 180 - RESOLUTION / 2, n_lon)
+
+    for lat in sample_lats:
+        li = int(np.argmin(np.abs(all_lats - lat)))
+        for lon in sample_lons:
+            lj = int(np.argmin(np.abs(all_lons - lon)))
             points.append(
-                ee.Feature(ee.Geometry.Point([lon, lat]),
-                           {"li": li, "lj": lj})
+                ee.Feature(
+                    ee.Geometry.Point([float(lon), float(lat)]),
+                    {"li": li, "lj": lj}
+                )
             )
+            lat_indices.append(li)
+            lon_indices.append(lj)
 
-    fc = ee.FeatureCollection(points)
-    sampled_fc = composite.select(["FDI", "PI"]).sampleRegions(
-        collection=fc, scale=1000, geometries=False
-    )
+    logger.info(f"Sampling {len(points)} points from GEE composite...")
 
-    try:
-        info = sampled_fc.getInfo()
-        features = info.get("features", [])
-        for feat in features:
-            props = feat.get("properties", {})
-            li = int(props.get("li", 0))
-            lj = int(props.get("lj", 0))
-            fdi_val = props.get("FDI", 0.0) or 0.0
-            pi_val  = props.get("PI", 0.0) or 0.0
-            # Normalize: FDI typically -0.05 to +0.1 → scale to [0,1]
-            fdi_norm = float(np.clip((fdi_val + 0.05) / 0.15, 0, 1))
-            pi_norm  = float(np.clip(pi_val, 0, 1))
-            prob = (fdi_norm + pi_norm) / 2.0
-            scores[li + lat_offset, lj] = prob
-    except Exception as exc:
-        logger.error(f"GEE sampling failed: {exc}")
+    # Process in batches of 500 to avoid GEE memory limits
+    BATCH = 500
+    for b_start in range(0, len(points), BATCH):
+        b_end = min(b_start + BATCH, len(points))
+        fc = ee.FeatureCollection(points[b_start:b_end])
+        try:
+            sampled = composite.select(["FDI", "PI"]).sampleRegions(
+                collection=fc, scale=1000, geometries=False
+            )
+            info = sampled.getInfo()
+            for feat in info.get("features", []):
+                props = feat.get("properties", {})
+                li = int(props.get("li", 0))
+                lj = int(props.get("lj", 0))
+                fdi_val = float(props.get("FDI") or 0.0)
+                pi_val  = float(props.get("PI")  or 0.0)
+                # Normalise FDI: typical range -0.05 to +0.10
+                fdi_norm = float(np.clip((fdi_val + 0.05) / 0.15, 0, 1))
+                pi_norm  = float(np.clip(pi_val, 0, 1))
+                scores[li, lj] = (fdi_norm + pi_norm) / 2.0
+            logger.info(f"  Batch {b_start}–{b_end} OK")
+        except Exception as exc:
+            logger.warning(f"  Batch {b_start}–{b_end} failed: {exc}")
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = DATA_DIR / "sentinel_scores.npy"
+    # Interpolate sparse samples to full 0.25° grid using scipy
+    from scipy.ndimage import zoom
+    if scores.max() > 0:
+        # Simple nearest-neighbour fill for unsampled cells
+        from scipy.ndimage import generic_filter
+        def _fill(arr):
+            if arr[len(arr) // 2] == 0 and arr.max() > 0:
+                return arr.max()
+            return arr[len(arr) // 2]
+        scores = generic_filter(scores, _fill, size=step + 1)
+
     np.save(str(out_path), scores)
-    logger.info(f"Sentinel-2 debris scores saved to {out_path} — shape {scores.shape}")
+    logger.info(
+        f"Saved sentinel_scores.npy — shape {scores.shape}, "
+        f"mean={scores.mean():.4f}, max={scores.max():.4f}"
+    )
     return scores
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    scores = fetch_sentinel_debris_scores(days_back=90)
-    print(f"Sentinel scores shape: {scores.shape}, mean: {scores.mean():.4f}")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    scores = fetch_sentinel_debris_scores(force_refresh=True)
+    print(f"Shape: {scores.shape}  mean: {scores.mean():.4f}  max: {scores.max():.4f}")

@@ -72,13 +72,13 @@ export default function TrajectoryLayer({
 }: Props) {
   // Refs: one polyline + one marker dot per particle
   const polylinesRef = useRef<google.maps.Polyline[]>([]);
-  const dotsRef      = useRef<google.maps.Marker[]>([]);
+  const dotsRef      = useRef<google.maps.marker.AdvancedMarkerElement[]>([]);
   const listenersRef = useRef<google.maps.MapsEventListener[]>([]);
 
   // ── Cleanup helper ────────────────────────────────────────────────────────
   const clearAll = useCallback(() => {
     polylinesRef.current.forEach(p => p.setMap(null));
-    dotsRef.current.forEach(d => d.setMap(null));
+    dotsRef.current.forEach(d => { d.map = null; });
     listenersRef.current.forEach(l => google.maps.event.removeListener(l));
     polylinesRef.current  = [];
     dotsRef.current       = [];
@@ -91,7 +91,7 @@ export default function TrajectoryLayer({
     clearAll();
 
     const newPolylines: google.maps.Polyline[] = [];
-    const newDots:      google.maps.Marker[]   = [];
+    const newDots:      google.maps.marker.AdvancedMarkerElement[] = [];
     const newListeners: google.maps.MapsEventListener[] = [];
 
     trajectories.forEach((traj) => {
@@ -129,25 +129,29 @@ export default function TrajectoryLayer({
 
       // Animated dot at current snapshot position
       const currentPos = { lat: snap[0], lng: snap[1] };
-      const dot = new google.maps.Marker({
+      
+      const dotElement = document.createElement("div");
+      const scale = srcType === 1 ? 10 : 8;
+      const strokeWeight = srcType === 1 ? 1.5 : 1;
+      dotElement.style.width = `${scale}px`;
+      dotElement.style.height = `${scale}px`;
+      dotElement.style.backgroundColor = strokeColor;
+      dotElement.style.opacity = srcType === 1 ? "0.95" : "0.8";
+      dotElement.style.border = `${strokeWeight}px solid #ffffff`;
+      dotElement.style.borderRadius = "50%";
+      dotElement.style.transform = "translate(-50%, -50%)";
+      
+      const dot = new google.maps.marker.AdvancedMarkerElement({
         position: currentPos,
         map,
         title: traj.source_label,
-        icon: {
-          path: google.maps.SymbolPath.CIRCLE,
-          scale:       srcType === 1 ? 5 : 4,  // beached slightly larger
-          fillColor:   strokeColor,
-          fillOpacity: srcType === 1 ? 0.95 : 0.8,
-          strokeColor: "#ffffff",
-          strokeWeight: srcType === 1 ? 1.5 : 1,
-        },
+        content: dotElement,
         zIndex: 2,
-        optimized: true,
       });
 
       // Click handler
       if (onParticleClick) {
-        const listener = dot.addListener("click", () => onParticleClick(traj));
+        const listener = dot.addListener("gmp-click", () => onParticleClick(traj));
         newListeners.push(listener);
       }
 
@@ -171,7 +175,7 @@ export default function TrajectoryLayer({
       const snaps = traj.snapshots;
       const idx   = Math.min(snapshotIndex, snaps.length - 1);
       const snap  = snaps[idx];
-      dot.setPosition({ lat: snap[0], lng: snap[1] });
+      dot.position = { lat: snap[0], lng: snap[1] };
 
       const srcType = snap[4] as SourceType;
       const ageDays = snap[3];
@@ -185,14 +189,15 @@ export default function TrajectoryLayer({
         default:           color = "#00d4c8";
       }
 
-      dot.setIcon({
-        path: google.maps.SymbolPath.CIRCLE,
-        scale:       srcType === 1 ? 5 : 4,
-        fillColor:   color,
-        fillOpacity: srcType === 1 ? 0.95 : 0.8,
-        strokeColor: "#ffffff",
-        strokeWeight: srcType === 1 ? 1.5 : 1,
-      });
+      if (dot.content instanceof HTMLElement) {
+        const scale = srcType === 1 ? 10 : 8;
+        const strokeWeight = srcType === 1 ? 1.5 : 1;
+        dot.content.style.width = `${scale}px`;
+        dot.content.style.height = `${scale}px`;
+        dot.content.style.backgroundColor = color;
+        dot.content.style.opacity = srcType === 1 ? "0.95" : "0.8";
+        dot.content.style.border = `${strokeWeight}px solid #ffffff`;
+      }
     });
   }, [snapshotIndex, colorBy, trajectories]);
 

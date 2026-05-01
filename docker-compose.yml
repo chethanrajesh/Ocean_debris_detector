@@ -1,22 +1,59 @@
-version: "3.9"
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  ocean_net:
+    driver: bridge
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  backend_data:   # persists all .npy simulation outputs across container restarts
 
 services:
+
+  # ── Backend API ─────────────────────────────────────────────────────────────
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     env_file:
       - ./backend/.env
+    environment:
+      # Override the GEE key path to the container-internal path
+      GEE_SERVICE_ACCOUNT_KEY: /app/gee_key.json
     volumes:
+      # Pre-computed simulation data (mount from host so you don't re-run on every start)
       - ./backend/data:/app/data
+      # GEE service account key (mount the actual file)
+      - ./backend/gee_key.json:/app/gee_key.json:ro
+    networks:
+      - ocean_net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s   # allow time for cache build on startup
 
+  # ── Frontend ─────────────────────────────────────────────────────────────────
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Inside Docker, frontend talks to backend via service name
+        NEXT_PUBLIC_API_URL: http://backend:8000
+        NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: ${NEXT_PUBLIC_GOOGLE_MAPS_API_KEY}
     ports:
       - "3000:3000"
     env_file:
       - ./frontend/.env.local
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    networks:
+      - ocean_net
     restart: unless-stopped

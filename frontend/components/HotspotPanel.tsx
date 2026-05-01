@@ -119,7 +119,7 @@ export default function HotspotPanel({ hotspot, onClose }: HotspotPanelProps) {
     <div
       id="hotspot-panel"
       className="glass-panel-dark w-[320px] p-5 flex flex-col gap-4 animate-slide-in"
-      style={{ maxHeight: "calc(100vh - 120px)", overflowY: "auto" }}
+      style={{ maxHeight: "calc(100vh - 200px)", overflowY: "auto" }}
     >
       {/* Header */}
       <div className="flex items-start justify-between">

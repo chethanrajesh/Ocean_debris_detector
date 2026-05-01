@@ -21,6 +21,7 @@ import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import ORJSONResponse, Response
 from pydantic import BaseModel
 
 load_dotenv()
@@ -59,6 +60,10 @@ class AppState:
     trajectories: np.ndarray | None  = None   # (N_particles, 14, 5)
     beaching_risk: np.ndarray | None = None   # (720, 1440)
     trajectory_ready: bool = False
+    # ── Pre-computed response cache (built once at startup) ───────────────────
+    # predictions_cache[t] = {"timestep":t, "nodes":[...], ...}
+    predictions_cache: dict = {}
+    currents_cache: dict | None = None
 
 
 # ── Land-mask utility ─────────────────────────────────────────────────────────
@@ -156,6 +161,99 @@ def _load_all_data():
         state.beaching_risk = np.load(str(beach_path))
         logger.info(f"Loaded beaching_risk.npy — shape {state.beaching_risk.shape}")
     state.trajectory_ready = state.trajectories is not None
+
+    # ── Pre-build response cache for all 361 timesteps ────────────────────────
+    if state.ready:
+        _build_predictions_cache()
+        _build_currents_cache()
+
+
+def _build_predictions_cache():
+    """
+    Pre-compute and pre-serialize all 361 prediction responses at startup.
+    Stored as raw orjson bytes — zero per-request work.
+    """
+    import orjson
+    if state.predictions is None or state.nodes is None:
+        return
+
+    logger.info("Building predictions cache for all timesteps...")
+    T_full = state.predictions.shape[1]
+    lats_all = state.nodes[:, 0]
+    lons_all = state.nodes[:, 1]
+
+    if state.ocean_node_mask is not None:
+        mask = state.ocean_node_mask
+        preds_ocean = state.predictions[mask]
+        lats_ocean  = lats_all[mask]
+        lons_ocean  = lons_all[mask]
+    else:
+        preds_ocean = state.predictions
+        lats_ocean  = lats_all
+        lons_ocean  = lons_all
+
+    MAX_NODES = 3000
+    for t in range(min(T_full, _MAX_TIMESTEPS + 1)):
+        densities = preds_ocean[:, t]
+        sig       = densities > 0.05
+        d_f, la_f, lo_f = densities[sig], lats_ocean[sig], lons_ocean[sig]
+        if len(d_f) > MAX_NODES:
+            top = np.argpartition(d_f, -MAX_NODES)[-MAX_NODES:]
+            d_f, la_f, lo_f = d_f[top], la_f[top], lo_f[top]
+        payload = {
+            "timestep":        t,
+            "total_timesteps": _MAX_TIMESTEPS + 1,
+            "mode":            "real" if t == 0 else "predicted",
+            "day":             round(t / 4, 1),
+            "nodes": [
+                {"lat": round(float(la_f[i]), 4),
+                 "lon": round(float(lo_f[i]), 4),
+                 "density": round(float(d_f[i]), 4)}
+                for i in range(len(d_f))
+            ],
+        }
+        # Store pre-serialized bytes
+        state.predictions_cache[t] = orjson.dumps(payload)
+    logger.info(f"Predictions cache built — {len(state.predictions_cache)} timesteps")
+
+
+def _build_currents_cache(max_nodes: int = 2000):
+    """Pre-compute and pre-serialize the currents response."""
+    import orjson
+    if state.nodes is None:
+        return
+    logger.info("Building currents cache...")
+    n_lat = int(180 / RESOLUTION)
+    n_lon = int(360 / RESOLUTION)
+    lats_grid = np.linspace(-90 + RESOLUTION/2,  90 - RESOLUTION/2, n_lat, dtype=np.float32)
+    lons_grid = np.linspace(-180 + RESOLUTION/2, 180 - RESOLUTION/2, n_lon, dtype=np.float32)
+
+    curr_field = state.currents
+    if curr_field is None or float(np.abs(curr_field).max()) < 1e-6:
+        curr_field = _build_synthetic_currents(lats_grid, lons_grid, state.land_mask)
+
+    lats = state.nodes[:, 0]
+    lons = state.nodes[:, 1]
+    il = np.clip(np.round((lats + 90  - RESOLUTION/2) / RESOLUTION).astype(int), 0, n_lat-1)
+    jl = np.clip(np.round((lons + 180 - RESOLUTION/2) / RESOLUTION).astype(int), 0, n_lon-1)
+    u_arr = curr_field[il, jl, 0]
+    v_arr = curr_field[il, jl, 1]
+    speed = np.sqrt(u_arr**2 + v_arr**2)
+    mask  = speed > 0.005
+    lats_f, lons_f = lats[mask], lons[mask]
+    u_f, v_f, spd_f = u_arr[mask], v_arr[mask], speed[mask]
+    if len(spd_f) > max_nodes:
+        top = np.argpartition(spd_f, -max_nodes)[-max_nodes:]
+        lats_f, lons_f, u_f, v_f = lats_f[top], lons_f[top], u_f[top], v_f[top]
+    payload = {
+        "nodes": [
+            {"lat": round(float(lats_f[i]), 4), "lon": round(float(lons_f[i]), 4),
+             "u": round(float(u_f[i]), 4), "v": round(float(v_f[i]), 4)}
+            for i in range(len(lats_f))
+        ]
+    }
+    state.currents_cache = orjson.dumps(payload)
+    logger.info(f"Currents cache built — {len(lats_f)} nodes")
 
 
 def _seed_demo_data():
@@ -280,21 +378,12 @@ def root():
 
 
 @app.get("/hotspots", tags=["Debris"])
-def get_hotspots() -> list[dict[str, Any]]:
-    """
-    Return all classified ocean plastic hotspot locations with metadata.
-
-    Each hotspot includes:
-    - latitude, longitude
-    - plastic_density  [0, 1]
-    - level            critical | high | moderate
-    - accumulation_trend increasing | stable | decreasing
-    - movement_vector  {u, v} in m/s
-    - source_estimate  nearest known terrestrial/coastal source region
-    """
+def get_hotspots():
+    """Return all classified ocean plastic hotspot locations."""
     if not state.ready:
-        raise HTTPException(status_code=503, detail="Data not yet available. Run the data pipeline first.")
-    return state.hotspots
+        raise HTTPException(status_code=503, detail="Data not yet available.")
+    import orjson
+    return Response(content=orjson.dumps(state.hotspots), media_type="application/json")
 
 
 # Max steps exposed to the frontend = 90 days × 4 steps/day = 360
@@ -302,126 +391,28 @@ _MAX_TIMESTEPS = 360
 
 
 @app.get("/predictions/{timestep}", tags=["Debris"])
-def get_predictions(timestep: int) -> dict[str, Any]:
-    """
-    Return per-node plastic density for a specific time step.
-
-    timestep = 0  → real initial debris positions (seeded from satellite/buoy data)
-    timestep > 0  → GNN + Lagrangian prediction (4 steps per day, max 90 days = 360)
-
-    Nodes that fall on land cells are excluded (land_mask filtered).
-    Returns up to 3000 highest-density ocean nodes for bandwidth efficiency.
-    """
-    if state.predictions is None or state.nodes is None:
+def get_predictions(timestep: int):
+    """Served from pre-serialized orjson cache — sub-millisecond response."""
+    if not state.ready:
         raise HTTPException(status_code=503, detail="Prediction data not available.")
-
-    T_full = state.predictions.shape[1]
-    T      = min(T_full, _MAX_TIMESTEPS + 1)   # cap to 90 days
     if not (0 <= timestep <= _MAX_TIMESTEPS):
-        raise HTTPException(
-            status_code=400,
-            detail=f"timestep must be in [0, {_MAX_TIMESTEPS}] (0–90 days). Got {timestep}.",
-        )
-
-    densities = state.predictions[:, min(timestep, T_full - 1)]  # (N,)
-    lats      = state.nodes[:, 0]   # (N,)
-    lons      = state.nodes[:, 1]   # (N,)
-
-    # ── Apply land-mask filter ───────────────────────────────────────────────
-    if state.ocean_node_mask is not None:
-        ocean_bool = state.ocean_node_mask
-        densities  = densities[ocean_bool]
-        lats       = lats[ocean_bool]
-        lons       = lons[ocean_bool]
-
-    # ── Skip near-zero density nodes ─────────────────────────────────────────
-    sig_mask  = densities > 0.05
-    d_f, la_f, lo_f = densities[sig_mask], lats[sig_mask], lons[sig_mask]
-
-    # ── Cap to 3000 highest-density nodes ────────────────────────────────────
-    MAX_NODES = 3000
-    if len(d_f) > MAX_NODES:
-        top_idx        = np.argpartition(d_f, -MAX_NODES)[-MAX_NODES:]
-        d_f, la_f, lo_f = d_f[top_idx], la_f[top_idx], lo_f[top_idx]
-
-    nodes_out = [
-        {
-            "lat":     round(float(la_f[i]), 4),
-            "lon":     round(float(lo_f[i]), 4),
-            "density": round(float(d_f[i]),  4),
-        }
-        for i in range(len(d_f))
-    ]
-
-    # t=0 = real seeded data; t>0 = GNN+Lagrangian forecast
-    mode = "real" if timestep == 0 else "predicted"
-
-    return {
-        "timestep":        timestep,
-        "total_timesteps": _MAX_TIMESTEPS + 1,   # 361 steps (0–360)
-        "mode":            mode,
-        "day":             round(timestep / 4, 1),
-        "nodes":           nodes_out,
-    }
+        raise HTTPException(status_code=400, detail=f"timestep must be in [0, {_MAX_TIMESTEPS}].")
+    t = min(timestep, len(state.predictions_cache) - 1)
+    if t in state.predictions_cache:
+        return Response(content=state.predictions_cache[t], media_type="application/json")
+    raise HTTPException(status_code=503, detail="Cache not ready.")
 
 
 
 @app.get("/currents", tags=["Oceanography"])
-def get_currents(max_nodes: int = 2000) -> dict[str, Any]:
-    """
-    Return ocean current vectors (u, v in m/s) on a coarse grid.
-    Falls back to synthetic gyre circulation when real current data is all-zero.
-    """
+def get_currents(max_nodes: int = 2000):
+    """Return ocean current vectors. Served from pre-serialized cache."""
     if state.nodes is None:
         raise HTTPException(status_code=503, detail="Node data not available.")
-
-    n_lat = int(180 / RESOLUTION)
-    n_lon = int(360 / RESOLUTION)
-
-    lats_grid = np.linspace(-90 + RESOLUTION / 2,  90 - RESOLUTION / 2, n_lat, dtype=np.float32)
-    lons_grid = np.linspace(-180 + RESOLUTION / 2, 180 - RESOLUTION / 2, n_lon, dtype=np.float32)
-
-    # Decide which current field to use
-    curr_field = state.currents  # (720, 1440, 2) or None
-    if curr_field is None or float(np.abs(curr_field).max()) < 1e-6:
-        # Real data unavailable — generate synthetic gyre circulation
-        curr_field = _build_synthetic_currents(lats_grid, lons_grid, state.land_mask)
-
-    lats = state.nodes[:, 0]
-    lons = state.nodes[:, 1]
-
-    il = np.clip(
-        np.round((lats + 90  - RESOLUTION / 2) / RESOLUTION).astype(int), 0, n_lat - 1
-    )
-    jl = np.clip(
-        np.round((lons + 180 - RESOLUTION / 2) / RESOLUTION).astype(int), 0, n_lon - 1
-    )
-
-    u_arr = curr_field[il, jl, 0]
-    v_arr = curr_field[il, jl, 1]
-    speed = np.sqrt(u_arr ** 2 + v_arr ** 2)
-
-    mask  = speed > 0.005
-    lats_f, lons_f = lats[mask], lons[mask]
-    u_f,    v_f    = u_arr[mask], v_arr[mask]
-    spd_f          = speed[mask]
-
-    if len(spd_f) > max_nodes:
-        top_idx = np.argpartition(spd_f, -max_nodes)[-max_nodes:]
-        lats_f, lons_f, u_f, v_f = (
-            lats_f[top_idx], lons_f[top_idx], u_f[top_idx], v_f[top_idx]
-        )
-
-    nodes_out = [
-        {
-            "lat": round(float(lats_f[i]), 4),
-            "lon": round(float(lons_f[i]), 4),
-            "u":   round(float(u_f[i]), 4),
-            "v":   round(float(v_f[i]), 4),
-        }
-        for i in range(len(lats_f))
-    ]
-    return {"nodes": nodes_out}
+    if state.currents_cache is not None:
+        return Response(content=state.currents_cache, media_type="application/json")
+    _build_currents_cache(max_nodes)
+    return Response(content=state.currents_cache or b'{"nodes":[]}', media_type="application/json")
 
 
 def _build_synthetic_currents(

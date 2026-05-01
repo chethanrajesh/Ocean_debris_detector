@@ -35,7 +35,7 @@ export default function RootLayout({
       <head>
         {/* Google Earth Engine JavaScript API */}
         <script
-          src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAAR0xfDfY3yLQtyvSNTCeQKnd91ea-8fQ&loading=async"
+          src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAAR0xfDfY3yLQtyvSNTCeQKnd91ea-8fQ&v=weekly&loading=async&libraries=marker"
         />
       </head>
       <body className="bg-[#020a12] overflow-hidden">

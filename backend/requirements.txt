@@ -1,18 +1,30 @@
-fastapi
-uvicorn[standard]
-numpy
-scipy
-xarray
-netCDF4
-pandas
-scikit-learn
-torch>=2.2.0
-torch-geometric>=2.5.0
-torch-scatter
-torch-sparse
-copernicusmarine
-earthengine-api
-python-dotenv
-requests
-tqdm
-matplotlib
+# ── API server ────────────────────────────────────────────────────────────────
+fastapi==0.135.2
+uvicorn[standard]==0.42.0
+orjson==3.11.7
+python-dotenv==1.2.2
+
+# ── Data / numerics ───────────────────────────────────────────────────────────
+numpy==2.4.3
+scipy==1.17.1
+pandas==2.3.3
+xarray==2026.2.0
+netCDF4==1.7.4
+scikit-learn==1.8.0
+
+# ── Data sources ──────────────────────────────────────────────────────────────
+requests==2.32.5
+requests-cache==1.3.1
+copernicusmarine==2.3.0
+earthengine-api==1.7.19
+pydap==3.5.9
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm==4.67.3
+
+# ── GNN (optional — only needed for training, not API serving) ────────────────
+# torch and torch-geometric are NOT installed in the Docker image by default
+# because they add ~3 GB and the API runs physics-only without a checkpoint.
+# To enable GNN: uncomment below and rebuild.
+# torch==2.11.0
+# torch-geometric==2.7.0

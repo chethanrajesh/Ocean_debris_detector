@@ -37,15 +37,37 @@ export default function GEEMap({ onMapReady }: GEEMapProps) {
       }
 
       const map = new window.google.maps.Map(containerRef.current!, {
+        mapId: "9569ac6eea69b8ef9367d3ea",
+        mapTypeId: "hybrid",
         center: { lat: 10, lng: 0 },
         zoom: 3,
         minZoom: 3,
-        maxZoom: 10,
-        disableDefaultUI: true,
+        maxZoom: 20, // Increased to allow high-resolution 3D tilting
+        disableDefaultUI: false,
+        
+        // Explicitly enable 3D interactions
+        tiltInteractionEnabled: true,
+        headingInteractionEnabled: true,
+
+        // Customised UI controls to match modern vector map layout
         zoomControl: true,
         zoomControlOptions: {
-          position: window.google.maps.ControlPosition.RIGHT_CENTER,
+          position: window.google.maps.ControlPosition.RIGHT_BOTTOM,
         },
+        fullscreenControl: true,
+        fullscreenControlOptions: {
+          position: window.google.maps.ControlPosition.RIGHT_BOTTOM,
+        },
+        tiltControl: true,
+        tiltControlOptions: {
+          position: window.google.maps.ControlPosition.RIGHT_BOTTOM,
+        },
+        streetViewControl: false, // Usually disabled for ocean trackers
+        mapTypeControl: true, // Allows manually toggling Hybrid/Satellite
+        mapTypeControlOptions: {
+          position: window.google.maps.ControlPosition.TOP_LEFT,
+        },
+
         // Start locked at world view; dragging enabled dynamically when zoomed in
         draggable: false,
         scrollwheel: false,
@@ -57,33 +79,6 @@ export default function GEEMap({ onMapReady }: GEEMapProps) {
           latLngBounds: { north: 85, south: -85, west: -180, east: 180 },
           strictBounds: true,
         },
-        styles: [
-          { elementType: "geometry", stylers: [{ color: "#020a12" }] },
-          { elementType: "labels", stylers: [{ visibility: "off" }] },
-          {
-            featureType: "water",
-            elementType: "geometry",
-            stylers: [{ color: "#051220" }],
-          },
-          {
-            featureType: "landscape",
-            elementType: "geometry",
-            stylers: [{ color: "#0a1a28" }],
-          },
-          {
-            featureType: "road",
-            stylers: [{ visibility: "off" }],
-          },
-          {
-            featureType: "administrative.country",
-            elementType: "geometry.stroke",
-            stylers: [{ color: "#133558" }, { weight: 0.8 }],
-          },
-          {
-            featureType: "administrative.province",
-            stylers: [{ visibility: "off" }],
-          },
-        ],
       });
 
       // ── Always freehand — drag/scroll/touch always enabled ──────────────────

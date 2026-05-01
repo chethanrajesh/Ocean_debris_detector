@@ -1,32 +1,22 @@
 """
 fetch_cmems.py
 Fetches Copernicus Marine (CMEMS) ocean current data using the
-copernicusmarine Python SDK.
+copernicusmarine Python SDK v2.x.
 
 Datasets fetched
 ----------------
-1. cmems_mod_glo_phy_anfc_0.083deg_P1D-m
-   Variables: uo, vo, zos (sea surface height)
-   Period: last 30 days + 7-day forecast
-
-2. cmems_mod_glo_phy_my_0.083_P1D-m  (GLOBAL_MULTIYEAR_PHY_001_030)
-   Variables: uo, vo
-   Period: 1993-01-01 to present — used for GNN training
+cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m
+  Variables: uo, vo  (surface u/v currents, m/s)
+  Period: last 5 days (analysis + short forecast)
 
 Output
 ------
-data/cmems_currents.npy     : (N_lat, N_lon, 2) float32 [u, v] m/s  (analysis)
-data/cmems_historical.npy   : (T, N_lat, N_lon, 2) float32           (training)
-
-Environment Variables Required
--------------------------------
-CMEMS_USERNAME : Copernicus Marine username
-CMEMS_PASSWORD : Copernicus Marine password
+data/cmems_currents.npy  : (720, 1440, 2) float32  [u, v] on 0.25° grid
+data/ocean_currents.npy  : same — canonical name read by the rest of the pipeline
 """
 import os
 import logging
-import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -36,176 +26,126 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
+DATA_DIR   = Path(__file__).parent.parent.parent / "data"
 RESOLUTION = 0.25
 
-# Analysis / forecast current dataset (ocean velocity u/v)
-ANFC_DATASET = "cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m"
-# Historical reanalysis current dataset
-HIST_DATASET = "cmems_mod_glo_phy_my_0.083_P1D-m"
+DATASET_ID = "cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m"
 
 
 def _get_credentials() -> tuple[str, str]:
-    username = os.environ.get("CMEMS_USERNAME")
-    password = os.environ.get("CMEMS_PASSWORD")
+    username = os.environ.get("CMEMS_USERNAME", "")
+    password = os.environ.get("CMEMS_PASSWORD", "")
     if not username or not password:
-        raise EnvironmentError(
-            "CMEMS_USERNAME and CMEMS_PASSWORD must be set in environment."
-        )
+        raise EnvironmentError("CMEMS_USERNAME and CMEMS_PASSWORD must be set in .env")
     return username, password
 
 
 def _interp_to_025(
-    src_lats: np.ndarray, src_lons: np.ndarray,
-    u: np.ndarray, v: np.ndarray
+    src_lats: np.ndarray,
+    src_lons: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Bilinear interpolation of CMEMS 0.083° data onto 0.25° grid."""
+    """Bilinear interpolation from CMEMS 0.083° grid onto 0.25° grid."""
     n_lat = int(180 / RESOLUTION)
     n_lon = int(360 / RESOLUTION)
-    tgt_lats = np.linspace(-90 + RESOLUTION / 2, 90 - RESOLUTION / 2, n_lat, dtype=np.float64)
+    tgt_lats = np.linspace(-90 + RESOLUTION / 2,  90 - RESOLUTION / 2, n_lat, dtype=np.float64)
     tgt_lons = np.linspace(-180 + RESOLUTION / 2, 180 - RESOLUTION / 2, n_lon, dtype=np.float64)
 
-    def _interp(data2d):
-        lat_sorted = src_lats if src_lats[0] < src_lats[-1] else src_lats[::-1]
-        d_sorted = data2d if src_lats[0] < src_lats[-1] else data2d[::-1, :]
-        interp = RegularGridInterpolator(
-            (lat_sorted, src_lons), d_sorted,
-            method="linear", bounds_error=False, fill_value=0.0
+    # Ensure lats are ascending
+    if src_lats[0] > src_lats[-1]:
+        src_lats = src_lats[::-1]
+        u = u[::-1, :]
+        v = v[::-1, :]
+
+    def _interp_one(data2d: np.ndarray) -> np.ndarray:
+        fn = RegularGridInterpolator(
+            (src_lats.astype(np.float64), src_lons.astype(np.float64)),
+            data2d.astype(np.float64),
+            method="linear",
+            bounds_error=False,
+            fill_value=0.0,
         )
         pts = np.stack(
             np.meshgrid(tgt_lats, tgt_lons, indexing="ij"), axis=-1
         ).reshape(-1, 2)
-        return interp(pts).reshape(n_lat, n_lon).astype(np.float32)
+        return fn(pts).reshape(n_lat, n_lon).astype(np.float32)
 
-    return _interp(u), _interp(v)
+    return _interp_one(u), _interp_one(v)
 
 
-def fetch_cmems_analysis() -> np.ndarray:
+def fetch_cmems_currents(force_refresh: bool = False) -> np.ndarray:
     """
-    Fetch the latest 30-day analysis + 7-day forecast from CMEMS.
-    Returns (N_lat, N_lon, 2) float32 [u, v] on 0.25° grid.
+    Download latest CMEMS surface currents and save to data/.
+
+    Returns (720, 1440, 2) float32 [u, v] on 0.25° grid.
     """
-    username, password = _get_credentials()
-    try:
-        import copernicusmarine as cm
-    except ImportError:
-        raise ImportError("copernicusmarine SDK not installed. Run: pip install copernicusmarine")
+    out_path = DATA_DIR / "cmems_currents.npy"
+    ocean_path = DATA_DIR / "ocean_currents.npy"
 
-    end_dt   = datetime.utcnow() + timedelta(days=5)
-    start_dt = datetime.utcnow() - timedelta(days=10)
-
-    logger.info(f"Fetching CMEMS analysis: {ANFC_DATASET}")
-    try:
-        ds = cm.open_dataset(
-            dataset_id=ANFC_DATASET,
-            variables=["uo", "vo"],
-            start_datetime=start_dt.strftime("%Y-%m-%dT00:00:00"),
-            end_datetime=end_dt.strftime("%Y-%m-%dT00:00:00"),
-            minimum_depth=0.0,
-            maximum_depth=1.0,
-            username=username,
-            password=password,
-        )
-
-        # Take surface layer mean (squeeze depth if only one level returned)
-        uo = ds["uo"]
-        vo = ds["vo"]
-        if "depth" in uo.dims:
-            uo = uo.isel(depth=0)
-            vo = vo.isel(depth=0)
-        u = uo.mean(dim="time").values
-        v = vo.mean(dim="time").values
-        lats = ds["latitude"].values
-        lons = ds["longitude"].values
-        ds.close()
-
-        u_025, v_025 = _interp_to_025(lats, lons, u, v)
-        result = np.stack([u_025, v_025], axis=-1)
-
-        # Save both as cmems_currents.npy and ocean_currents.npy
-        # (ocean_currents.npy is what the rest of the pipeline reads)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        np.save(str(DATA_DIR / "cmems_currents.npy"),  result)
-        np.save(str(DATA_DIR / "ocean_currents.npy"),  result)
-        logger.info(f"Saved cmems_currents.npy + ocean_currents.npy — shape {result.shape}, "
-                    f"max |u|={float(np.abs(result[...,0]).max()):.3f} m/s")
-        return result
-
-    except Exception as exc:
-        logger.error(f"CMEMS analysis fetch failed: {exc}")
-        n_lat = int(180 / RESOLUTION)
-        n_lon = int(360 / RESOLUTION)
-        return np.zeros((n_lat, n_lon, 2), dtype=np.float32)
-
-
-def fetch_cmems_historical(
-    start_year: int = 1993,
-    end_year: int = 2024,
-    sample_every_n_days: int = 30
-) -> np.ndarray:
-    """
-    Fetch historical CMEMS reanalysis for GNN training.
-    Returns (T, N_lat, N_lon, 2) float32.
-    sample_every_n_days controls temporal density (default: monthly snapshots).
-    """
-    username, password = _get_credentials()
-    try:
-        import copernicusmarine as cm
-    except ImportError:
-        raise ImportError("copernicusmarine SDK not installed.")
+    if out_path.exists() and not force_refresh:
+        logger.info(f"Loading cached CMEMS currents from {out_path}")
+        arr = np.load(str(out_path))
+        if not ocean_path.exists():
+            np.save(str(ocean_path), arr)
+        return arr
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    hist_path = DATA_DIR / "cmems_historical.npy"
-    if hist_path.exists():
-        logger.info(f"Loading cached CMEMS historical from {hist_path}")
-        return np.load(str(hist_path))
+    username, password = _get_credentials()
 
-    n_lat = int(180 / RESOLUTION)
-    n_lon = int(360 / RESOLUTION)
-    frames = []
+    try:
+        import copernicusmarine as cm
+    except ImportError:
+        raise ImportError("Run: pip install copernicusmarine")
 
-    # Sample one snapshot per month to keep data manageable
-    from datetime import date
-    snapshots = []
-    for year in range(start_year, end_year + 1):
-        for month in range(1, 13):
-            snapshots.append(date(year, month, 15))
+    now      = datetime.now(timezone.utc)
+    end_dt   = now
+    start_dt = now - timedelta(days=5)
 
-    logger.info(f"Fetching {len(snapshots)} historical CMEMS snapshots...")
-    for snap in snapshots:
-        snap_str = snap.strftime("%Y-%m-%dT00:00:00")
-        try:
-            ds = cm.open_dataset(
-                dataset_id=HIST_DATASET,
-                variables=["uo", "vo"],
-                start_datetime=snap_str,
-                end_datetime=snap_str,
-                minimum_depth=0.0,
-                maximum_depth=1.0,
-                username=username,
-                password=password,
-            )
-            u = ds["uo"].isel(depth=0, time=0).values
-            v = ds["vo"].isel(depth=0, time=0).values
-            lats = ds["latitude"].values
-            lons = ds["longitude"].values
-            ds.close()
-            u_025, v_025 = _interp_to_025(lats, lons, u, v)
-            frames.append(np.stack([u_025, v_025], axis=-1))
-        except Exception as exc:
-            logger.warning(f"  Skipped {snap}: {exc}")
+    logger.info(f"Fetching CMEMS currents {start_dt.date()} → {end_dt.date()} ...")
 
-    if frames:
-        result = np.stack(frames, axis=0).astype(np.float32)   # (T, N_lat, N_lon, 2)
-        np.save(str(hist_path), result)
-        logger.info(f"Saved cmems_historical.npy — shape {result.shape}")
-        return result
-    else:
-        logger.warning("No historical CMEMS data retrieved.")
-        return np.zeros((1, n_lat, n_lon, 2), dtype=np.float32)
+    ds = cm.open_dataset(
+        dataset_id=DATASET_ID,
+        variables=["uo", "vo"],
+        minimum_depth=0.0,
+        maximum_depth=1.0,
+        start_datetime=start_dt.strftime("%Y-%m-%dT00:00:00"),
+        end_datetime=end_dt.strftime("%Y-%m-%dT00:00:00"),
+        username=username,
+        password=password,
+    )
+
+    # Take surface layer, average over available time steps
+    uo = ds["uo"]
+    vo = ds["vo"]
+    if "depth" in uo.dims:
+        uo = uo.isel(depth=0)
+        vo = vo.isel(depth=0)
+    u = uo.mean(dim="time").values.astype(np.float32)
+    v = vo.mean(dim="time").values.astype(np.float32)
+    lats = ds["latitude"].values.astype(np.float64)
+    lons = ds["longitude"].values.astype(np.float64)
+    ds.close()
+
+    logger.info(f"  Raw shape: u={u.shape}, lat range [{lats.min():.1f}, {lats.max():.1f}]")
+
+    # Replace NaN (land/missing) with 0 before interpolation
+    u = np.nan_to_num(u, nan=0.0)
+    v = np.nan_to_num(v, nan=0.0)
+
+    u_025, v_025 = _interp_to_025(lats, lons, u, v)
+    result = np.stack([u_025, v_025], axis=-1)  # (720, 1440, 2)
+
+    np.save(str(out_path),   result)
+    np.save(str(ocean_path), result)
+    logger.info(
+        f"Saved cmems_currents.npy + ocean_currents.npy — shape {result.shape}, "
+        f"max|u|={float(np.abs(result[..., 0]).max()):.3f} m/s"
+    )
+    return result
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    curr = fetch_cmems_analysis()
-    print(f"CMEMS analysis shape: {curr.shape}, max |u|: {np.abs(curr[..., 0]).max():.3f}")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    arr = fetch_cmems_currents(force_refresh=True)
+    print(f"Shape: {arr.shape}  max|u|={np.abs(arr[...,0]).max():.3f}  max|v|={np.abs(arr[...,1]).max():.3f}")

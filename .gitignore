@@ -2,6 +2,7 @@
 backend/.env
 frontend/.env.local
 frontend/.env
+.env
 **/*.json
 # Re-allow non-secret JSON configs
 !frontend/tsconfig.json
@@ -64,3 +65,8 @@ Thumbs.db
 # ── Docker ────────────────────────────────────────────────────────────────────
 # Keep docker-compose.yml but ignore local overrides
 docker-compose.override.yml
+
+# ── Temp test scripts ─────────────────────────────────────────────────────────
+backend/test_*.py
+backend/find_datasets.py
+backend/probe_network.py
