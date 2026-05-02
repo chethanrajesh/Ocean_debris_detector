@@ -756,6 +756,7 @@ def get_beaching_risk(top_n: int = 200) -> dict[str, Any]:
 def seed_custom_particle(body: SeedRequest) -> dict[str, Any]:
     """
     Inject a custom debris point and return its 90-day predicted trajectory.
+    If the point is on land, automatically snaps to the nearest ocean cell.
     Runs a single-particle physics simulation on-the-fly (~1 second).
     """
     if state.land_mask is None or state.currents is None:
@@ -773,23 +774,61 @@ def seed_custom_particle(body: SeedRequest) -> dict[str, Any]:
     if wind_path.exists():
         winds = np.load(str(wind_path))
 
+    # ── Snap to nearest ocean cell if point is on land ────────────────────────
+    def _latlon_to_idx(lat: float, lon: float):
+        i = int(np.clip(np.round((lat + 90  - RESOLUTION/2) / RESOLUTION), 0, n_lat-1))
+        j = int(np.clip(np.round((lon + 180 - RESOLUTION/2) / RESOLUTION), 0, n_lon-1))
+        return i, j
+
+    seed_lat, seed_lon = body.lat, body.lon
+    si, sj = _latlon_to_idx(seed_lat, seed_lon)
+    if not state.land_mask[si, sj]:
+        # On land — search outward in expanding rings for nearest ocean cell
+        found = False
+        for radius in range(1, 20):
+            for di in range(-radius, radius + 1):
+                for dj in range(-radius, radius + 1):
+                    if abs(di) != radius and abs(dj) != radius:
+                        continue
+                    ni = int(np.clip(si + di, 0, n_lat - 1))
+                    nj = (sj + dj) % n_lon
+                    if state.land_mask[ni, nj]:
+                        seed_lat = float(lats_grid[ni])
+                        seed_lon = float(lons_grid[nj])
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if not found:
+            raise HTTPException(status_code=400,
+                detail="No ocean cell found near the given coordinates.")
+
     sim = TrajectorySimulator(
         state.land_mask.astype(bool), state.currents, winds,
         lats_grid, lons_grid, rng_seed=0
     )
 
-    seed = np.array([[body.lat, body.lon, min(1.0, body.mass_kg / 1000.0)]], dtype=np.float32)
+    seed = np.array([[seed_lat, seed_lon, min(1.0, body.mass_kg / 1000.0)]], dtype=np.float32)
     try:
         traj, _ = sim.run(seed, n_days=90)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Simulation failed: {exc}")
+
+    if len(traj) == 0:
+        raise HTTPException(status_code=400,
+            detail="Simulation produced no output — point may be too close to land.")
 
     snaps = traj[0]   # (14, 5) for the single particle
     final_src = int(snaps[-1, 4])
     status_map = {0: "active", 1: "beached", 2: "converging"}
 
     return {
-        "origin":        {"lat": body.lat, "lon": body.lon, "mass_kg": body.mass_kg},
+        "origin":        {"lat": body.lat, "lon": body.lon,
+                          "snapped_lat": round(seed_lat, 4),
+                          "snapped_lon": round(seed_lon, 4),
+                          "mass_kg": body.mass_kg},
         "snapshot_days": _SNAPSHOT_DAYS,
         "trajectory":    [
             [round(float(s[0]), 4), round(float(s[1]), 4),
@@ -799,3 +838,89 @@ def seed_custom_particle(body: SeedRequest) -> dict[str, Any]:
         ],
         "final_status":  status_map.get(final_src, "active"),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCATION SEARCH ENDPOINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Curated list of major beaches, oceans, and coastal locations worldwide
+_LOCATIONS: list[dict] = [
+    # ── Major Ocean Gyres ─────────────────────────────────────────────────────
+    {"name": "North Pacific Garbage Patch", "lat": 32.0,  "lon": -141.0, "type": "gyre"},
+    {"name": "South Pacific Gyre",          "lat": -32.0, "lon": -88.0,  "type": "gyre"},
+    {"name": "North Atlantic Gyre",         "lat": 28.0,  "lon": -63.0,  "type": "gyre"},
+    {"name": "South Atlantic Gyre",         "lat": -28.0, "lon": -15.0,  "type": "gyre"},
+    {"name": "Indian Ocean Gyre",           "lat": -26.0, "lon": 76.0,   "type": "gyre"},
+    {"name": "Sargasso Sea",                "lat": 27.0,  "lon": -65.0,  "type": "gyre"},
+    # ── Famous Beaches ────────────────────────────────────────────────────────
+    {"name": "Kamilo Beach, Hawaii (most polluted)", "lat": 18.9,  "lon": -155.6, "type": "beach"},
+    {"name": "Henderson Island, Pacific",            "lat": -24.4, "lon": -128.3, "type": "beach"},
+    {"name": "Juhu Beach, Mumbai",                   "lat": 19.1,  "lon": 72.8,   "type": "beach"},
+    {"name": "Versova Beach, Mumbai",                "lat": 19.1,  "lon": 72.8,   "type": "beach"},
+    {"name": "Marina Beach, Chennai",                "lat": 13.0,  "lon": 80.3,   "type": "beach"},
+    {"name": "Kuta Beach, Bali",                     "lat": -8.7,  "lon": 115.2,  "type": "beach"},
+    {"name": "Patong Beach, Phuket",                 "lat": 7.9,   "lon": 98.3,   "type": "beach"},
+    {"name": "Copacabana Beach, Rio",                "lat": -22.9, "lon": -43.2,  "type": "beach"},
+    {"name": "Bondi Beach, Sydney",                  "lat": -33.9, "lon": 151.3,  "type": "beach"},
+    {"name": "Waikiki Beach, Hawaii",                "lat": 21.3,  "lon": -157.8, "type": "beach"},
+    {"name": "Miami Beach, Florida",                 "lat": 25.8,  "lon": -80.1,  "type": "beach"},
+    {"name": "Santa Monica Beach, California",       "lat": 34.0,  "lon": -118.5, "type": "beach"},
+    {"name": "Brighton Beach, UK",                   "lat": 50.8,  "lon": -0.1,   "type": "beach"},
+    {"name": "Barceloneta Beach, Barcelona",         "lat": 41.4,  "lon": 2.2,    "type": "beach"},
+    {"name": "Pattaya Beach, Thailand",              "lat": 12.9,  "lon": 100.9,  "type": "beach"},
+    {"name": "Boracay Beach, Philippines",           "lat": 11.9,  "lon": 121.9,  "type": "beach"},
+    {"name": "Maldives (Male Atoll)",                "lat": 4.2,   "lon": 73.5,   "type": "beach"},
+    {"name": "Seychelles (Mahe Island)",             "lat": -4.7,  "lon": 55.5,   "type": "beach"},
+    {"name": "Zanzibar Beach, Tanzania",             "lat": -6.2,  "lon": 39.2,   "type": "beach"},
+    {"name": "Durban Beach, South Africa",           "lat": -29.9, "lon": 31.0,   "type": "beach"},
+    {"name": "Cape Town Beach, South Africa",        "lat": -33.9, "lon": 18.4,   "type": "beach"},
+    # ── Major Oceans / Seas ───────────────────────────────────────────────────
+    {"name": "Pacific Ocean (Central)",   "lat": 0.0,   "lon": -160.0, "type": "ocean"},
+    {"name": "Atlantic Ocean (Central)",  "lat": 0.0,   "lon": -30.0,  "type": "ocean"},
+    {"name": "Indian Ocean (Central)",    "lat": -20.0, "lon": 80.0,   "type": "ocean"},
+    {"name": "Arctic Ocean",              "lat": 80.0,  "lon": 0.0,    "type": "ocean"},
+    {"name": "Southern Ocean",            "lat": -60.0, "lon": 0.0,    "type": "ocean"},
+    {"name": "Mediterranean Sea",         "lat": 36.0,  "lon": 15.0,   "type": "sea"},
+    {"name": "Caribbean Sea",             "lat": 15.0,  "lon": -75.0,  "type": "sea"},
+    {"name": "South China Sea",           "lat": 12.0,  "lon": 114.0,  "type": "sea"},
+    {"name": "Bay of Bengal",             "lat": 14.0,  "lon": 85.0,   "type": "sea"},
+    {"name": "Arabian Sea",               "lat": 18.0,  "lon": 65.0,   "type": "sea"},
+    {"name": "Gulf of Mexico",            "lat": 25.0,  "lon": -90.0,  "type": "sea"},
+    {"name": "North Sea",                 "lat": 56.0,  "lon": 4.0,    "type": "sea"},
+    {"name": "Red Sea",                   "lat": 20.0,  "lon": 38.0,   "type": "sea"},
+    {"name": "Black Sea",                 "lat": 43.0,  "lon": 34.0,   "type": "sea"},
+    {"name": "Coral Sea",                 "lat": -18.0, "lon": 152.0,  "type": "sea"},
+    {"name": "Tasman Sea",                "lat": -40.0, "lon": 160.0,  "type": "sea"},
+    # ── Major River Mouths (high plastic input) ───────────────────────────────
+    {"name": "Yangtze River Delta, China",      "lat": 30.0,  "lon": 121.5, "type": "river"},
+    {"name": "Ganges Delta, Bangladesh",        "lat": 23.7,  "lon": 90.4,  "type": "river"},
+    {"name": "Mekong Delta, Vietnam",           "lat": 10.0,  "lon": 105.0, "type": "river"},
+    {"name": "Pearl River Delta, China",        "lat": 23.0,  "lon": 113.5, "type": "river"},
+    {"name": "Amazon River Mouth, Brazil",      "lat": -0.5,  "lon": -50.0, "type": "river"},
+    {"name": "Congo River Mouth, DRC",          "lat": -4.3,  "lon": 15.3,  "type": "river"},
+    {"name": "Niger Delta, Nigeria",            "lat": 4.5,   "lon": 6.0,   "type": "river"},
+    {"name": "Indus Delta, Pakistan",           "lat": 24.0,  "lon": 67.5,  "type": "river"},
+    {"name": "Mississippi River Delta, USA",    "lat": 29.0,  "lon": -89.2, "type": "river"},
+]
+
+
+@app.get("/locations/search", tags=["Location"])
+def search_locations(q: str = "", type: str = "") -> list[dict]:
+    """
+    Search for beaches, oceans, seas, and river mouths by name.
+    Returns matching locations with lat/lon for use with /trajectories/seed.
+
+    Parameters
+    ----------
+    q    : search query (partial name match, case-insensitive)
+    type : filter by type — beach | ocean | sea | river | gyre (optional)
+    """
+    results = _LOCATIONS
+    if q:
+        q_lower = q.lower()
+        results = [loc for loc in results if q_lower in loc["name"].lower()]
+    if type:
+        results = [loc for loc in results if loc["type"] == type.lower()]
+    return results[:20]  # cap at 20 results
+

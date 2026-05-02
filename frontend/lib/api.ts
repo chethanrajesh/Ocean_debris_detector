@@ -212,3 +212,19 @@ export async function seedCustomParticle(
   );
   return data;
 }
+
+// ── Location search ───────────────────────────────────────────────────────────
+
+export interface Location {
+  name: string;
+  lat:  number;
+  lon:  number;
+  type: "beach" | "ocean" | "sea" | "river" | "gyre";
+}
+
+export async function searchLocations(q: string, type?: string): Promise<Location[]> {
+  const params = new URLSearchParams({ q });
+  if (type) params.set("type", type);
+  const { data } = await client.get<Location[]>(`/locations/search?${params}`);
+  return data;
+}
