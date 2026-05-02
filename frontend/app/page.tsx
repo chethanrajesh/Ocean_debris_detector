@@ -12,7 +12,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import {
   Waves, Zap, Activity, Globe2, RefreshCw,
-  Eye, EyeOff, Layers, Navigation, Anchor, Play, Pause, MapPin,
+  Eye, EyeOff, Layers, Navigation, Anchor, Play, Pause,
 } from "lucide-react";
 
 import {
@@ -33,7 +33,6 @@ const LegendPanel        = dynamic(() => import("@/components/LegendPanel"),    
 const TrajectoryLayer    = dynamic(() => import("@/components/TrajectoryLayer"),    { ssr: false });
 const BeachingRiskLayer  = dynamic(() => import("@/components/BeachingRiskLayer"), { ssr: false });
 const TrajectoryPanel    = dynamic(() => import("@/components/TrajectoryPanel"),    { ssr: false });
-const LocationTracker    = dynamic(() => import("@/components/LocationTracker"),    { ssr: false });
 import Draggable from "@/components/Draggable";
 
 // ── Dashboard mode ───────────────────────────────────────────────────────────
@@ -223,7 +222,6 @@ export default function DashboardPage() {
   const [showHeatmap,     setShowHeatmap]   = useState(true);
   const [showCurrents,    setShowCurrents]  = useState(true);
   const [showBeaching,    setShowBeaching]  = useState(true);
-  const [showTracker,     setShowTracker]   = useState(false);
 
   const mode: PredictionMode = timestep === 0 ? "real" : "predicted";
   const fetchRef = useRef(false);
@@ -415,18 +413,6 @@ export default function DashboardPage() {
               {apiStatus === "ok" ? "Live" : apiStatus === "error" ? "Offline" : "Connecting"}
             </span>
           </div>
-          {/* Location tracker toggle */}
-          <button
-            onClick={() => setShowTracker(v => !v)}
-            title="Track debris from a location"
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 border"
-            style={showTracker
-              ? { background: "rgba(0,212,200,0.18)", borderColor: "rgba(0,212,200,0.4)", color: "#00d4c8" }
-              : { background: "var(--ocean-800)", borderColor: "var(--glass-border)", color: "var(--text-muted)" }
-            }>
-            <MapPin size={11} />
-            Track Location
-          </button>
           <button id="refresh-btn" onClick={handleRefresh} disabled={loading}
             className="w-8 h-8 rounded-lg bg-[var(--ocean-700)] hover:bg-[var(--ocean-600)]
                        flex items-center justify-center text-[var(--text-secondary)]
@@ -554,16 +540,6 @@ export default function DashboardPage() {
       })}>
         <LegendPanel />
       </Draggable>
-
-      {/* ── Location Tracker panel — floats top-right below hotspot panel ── */}
-      {showTracker && (
-        <Draggable id="location-tracker-float" defaultPosition={() => ({
-          x: window.innerWidth - 340,
-          y: 68,
-        })}>
-          <LocationTracker map={map} onClose={() => setShowTracker(false)} />
-        </Draggable>
-      )}
 
       {/* ── Loading overlay ── */}
       {(loading || (dashMode === "trajectory" && trajLoading)) && (
